@@ -1,8 +1,8 @@
-from typing import Any, List, Optional, Tuple, Union, TypeAlias
+from typing import List, Optional, Tuple, Union, TypeAlias
 from enum import Enum
 import asyncio
 import structlog
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.memory import (
     ConversationBufferMemory,
     ConversationSummaryBufferMemory,
@@ -11,15 +11,16 @@ from langchain.memory import (
 )
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_community.retrievers import TimeWeightedVectorStoreRetriever
+from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from backend.llm_token_counter import LLMTokenCounter
-from backend.vector_store_manager import VectorStoreManager, DocumentList
 
 logger = structlog.get_logger(__name__)
 
 # Type aliases for clarity
 MessagePair: TypeAlias = Tuple[str, str]
 MemoryType: TypeAlias = Union[ConversationBufferMemory, ConversationSummaryBufferMemory, CombinedMemory]
+DocumentList: TypeAlias = List[Document]
 
 # Constants
 SHORT_TERM_TOKEN_LIMIT: int = 1000
@@ -45,11 +46,10 @@ class ConversationMemoryManager:
     Attributes:
         llm: ChatOpenAI instance for language model interactions.
         model_name: Name of the LLM model (e.g., 'gpt-4o').
-        openai_api_key: OpenAI API key for embeddings.
         llm_token_encoder: LLMTokenCounter instance for counting tokens.
         max_context_tokens: Maximum tokens allowed in the context window.
         fallback_token_limit: Token limit for the fallback memory strategy.
-        vector_store_manager: Manager for FAISS vector store operations.
+        embeddings: OpenAIEmbeddings instance for vector store initialization.
         history: List of (user_content, assistant_content) tuples.
         llm_token_count: Total token count of the conversation history.
         memory: Current memory object (buffer, summary, or combined).
@@ -59,15 +59,14 @@ class ConversationMemoryManager:
     def __init__(self) -> None:
         """Initialize ConversationMemoryManager without dependencies.
 
-        Dependencies must be set via async_initialize to support async vector store initialization.
+        Dependencies must be set via async_initialize to support async initialization.
         """
         self.llm: Optional[ChatOpenAI] = None
         self.model_name: Optional[str] = None
-        self.openai_api_key: Optional[str] = None
         self.llm_token_encoder: Optional[LLMTokenCounter] = None
         self.max_context_tokens: Optional[int] = None
         self.fallback_token_limit: Optional[int] = None
-        self.vector_store_manager: Optional[VectorStoreManager] = None
+        self.embeddings: Optional[OpenAIEmbeddings] = None
         self.logger = logger.bind(class_name=self.__class__.__name__)
         self.history: List[MessagePair] = []
         self.llm_token_count: int = 0
@@ -78,38 +77,30 @@ class ConversationMemoryManager:
         self,
         llm: ChatOpenAI,
         model_name: str,
-        openai_api_key: str,
         llm_token_encoder: LLMTokenCounter,
         max_context_tokens: int,
         fallback_token_limit: int,
-        vector_store_manager: VectorStoreManager
+        embeddings: OpenAIEmbeddings,
     ) -> None:
         """Asynchronously initialize ConversationMemoryManager with dependencies.
 
         Args:
             llm: Initialized ChatOpenAI instance for language model interactions.
             model_name: Name of the LLM model (e.g., 'gpt-4o').
-            openai_api_key: OpenAI API key for embeddings.
             llm_token_encoder: LLMTokenCounter instance for counting tokens.
             max_context_tokens: Maximum tokens allowed in the context window.
             fallback_token_limit: Token limit for the fallback memory strategy.
-            vector_store_manager: Manager for FAISS vector store operations.
+            embeddings: Pre-initialized OpenAIEmbeddings instance for vector store.
 
         Raises:
-            ValueError: If configuration is invalid (e.g., negative token limits).
+            ValueError: If configuration is invalid (handled by caller).
         """
-        if max_context_tokens <= 0:
-            raise ValueError(f"max_context_tokens must be positive, got {max_context_tokens}")
-        if fallback_token_limit <= 0:
-            raise ValueError(f"fallback_token_limit must be positive, got {fallback_token_limit}")
-
         self.llm = llm
         self.model_name = model_name
-        self.openai_api_key = openai_api_key
         self.llm_token_encoder = llm_token_encoder
         self.max_context_tokens = max_context_tokens
         self.fallback_token_limit = fallback_token_limit
-        self.vector_store_manager = vector_store_manager
+        self.embeddings = embeddings
         self.memory, self.memory_strategy = await self._initialize_short_term_memory([])
 
     async def add_message(self, message_pair: MessagePair) -> None:
@@ -119,13 +110,9 @@ class ConversationMemoryManager:
             message_pair: Tuple of (user_content, assistant_content) strings.
 
         Raises:
-            ValueError: If message pair is invalid, token counting fails, or memory is not initialized.
+            ValueError: If message pair is invalid, token counting fails, or manager is not initialized.
             asyncio.TimeoutError: If memory update exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
-        if not self.llm_token_encoder or not self.memory:
-            self.logger.error("ConversationMemoryManager not initialized")
-            raise ValueError("ConversationMemoryManager not initialized")
-
         try:
             async def update_memory() -> None:
                 user_content, assistant_content = message_pair
@@ -161,25 +148,6 @@ class ConversationMemoryManager:
         except Exception as e:
             self.logger.error("Failed to add message pair", message_pair=message_pair, error=str(e), exc_info=True)
             raise ValueError(f"Failed to add message pair: {str(e)}") from e
-
-    async def asimilarity_search(self, query: str, k: int = VECTOR_RETRIEVER_K) -> DocumentList:
-        """Perform an asynchronous similarity search on the vector store.
-
-        Args:
-            query: Query string to search for.
-            k: Number of results to return (defaults to VECTOR_RETRIEVER_K).
-
-        Returns:
-            DocumentList: List of FAISS Document objects.
-
-        Raises:
-            ValueError: If vector store manager is not initialized or search fails.
-            asyncio.TimeoutError: If search exceeds timeout.
-        """
-        if not self.vector_store_manager:
-            self.logger.error("VectorStoreManager not initialized")
-            raise ValueError("VectorStoreManager not initialized")
-        return await self.vector_store_manager.asimilarity_search(query, k)
 
     def _get_expected_strategy(self, llm_token_count: int) -> MemoryStrategy:
         """Determine the appropriate memory strategy based on token count.
@@ -327,6 +295,9 @@ class ConversationMemoryManager:
     ) -> Tuple[CombinedMemory, MemoryStrategy]:
         """Initialize advanced memory asynchronously with entities and vector store for high token counts.
 
+        Creates a FAISS vector store for conversation history using provided embeddings,
+        and combines buffer, summary, entity, and vector memory for enhanced context.
+
         Args:
             history: List of (user_content, assistant_content) tuples.
 
@@ -335,13 +306,11 @@ class ConversationMemoryManager:
 
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
-            ValueError: If vector store manager is not initialized.
+            ValueError: If vector store initialization fails or embeddings are not initialized.
         """
-        if not self.vector_store_manager or not self.vector_store_manager.vector_store:
-            self.logger.error("VectorStoreManager or vector store not initialized")
-            raise ValueError("VectorStoreManager or vector store not initialized")
+        self.logger.info("Initializing ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
 
-        self.logger.info("Initialized ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
+        # Initialize memory components
         buffer_memory = ConversationBufferMemory(
             memory_key="chat_history",
             return_messages=True,
@@ -357,13 +326,9 @@ class ConversationMemoryManager:
             llm=self.llm,
             memory_key="chat_history"
         )
-        retriever = TimeWeightedVectorStoreRetriever(
-            vectorstore=self.vector_store_manager.vector_store,
-            decay_rate=VECTOR_RETRIEVER_DECAY_RATE,
-            k=VECTOR_RETRIEVER_K
-        )
-        vector_memory = retriever.as_memory(memory_key="chat_history")
 
+        # Load messages and build documents
+        documents: DocumentList = []
         async def load_messages() -> None:
             for user_content, assistant_content in history:
                 buffer_memory.chat_memory.add_user_message(user_content)
@@ -371,12 +336,41 @@ class ConversationMemoryManager:
                 summary_memory.chat_memory.add_user_message(user_content)
                 summary_memory.chat_memory.add_ai_message(assistant_content)
                 entity_memory.save_context({"input": user_content}, {"output": assistant_content})
-                vector_memory.save_context({"input": user_content}, {"output": assistant_content})
+                documents.append(
+                    Document(
+                        page_content=f"User: {user_content}\nAssistant: {assistant_content}",
+                        metadata={"user_content": user_content, "assistant_content": assistant_content}
+                    )
+                )
 
         await asyncio.wait_for(
             asyncio.to_thread(load_messages),
             timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
+
+        # Create FAISS vector store for conversation history
+        try:
+            async def init_vector_store() -> FAISS:
+                if not self.embeddings:
+                    raise ValueError("Embeddings not initialized")
+                return FAISS.from_documents(documents, self.embeddings)
+
+            vector_store = await asyncio.wait_for(
+                asyncio.to_thread(init_vector_store),
+                timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            )
+        except Exception as e:
+            self.logger.error("Failed to initialize FAISS vector store", error=str(e), exc_info=True)
+            raise ValueError(f"Failed to initialize vector store for conversation history: {str(e)}") from e
+
+        # Use TimeWeightedVectorStoreRetriever for conversation history searches
+        retriever = TimeWeightedVectorStoreRetriever(
+            vectorstore=vector_store,
+            decay_rate=VECTOR_RETRIEVER_DECAY_RATE,
+            k=VECTOR_RETRIEVER_K
+        )
+        vector_memory = retriever.as_memory(memory_key="chat_history")
+
         combined_memory = CombinedMemory(
             memories=[buffer_memory, summary_memory, entity_memory, vector_memory],
             memory_key="chat_history"
@@ -414,9 +408,6 @@ class ConversationMemoryManager:
             Tuple[MemoryType, MemoryStrategy]: Current memory object and strategy.
 
         Raises:
-            ValueError: If memory is not initialized.
+            ValueError: If manager is not initialized.
         """
-        if not self.memory or not self.memory_strategy:
-            self.logger.error("Memory not initialized")
-            raise ValueError("Memory not initialized")
         return self.memory, self.memory_strategy

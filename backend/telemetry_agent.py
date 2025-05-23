@@ -3,7 +3,7 @@ import os
 import structlog
 import asyncio
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import Tool
 from langchain.agents import create_openai_tools_agent, AgentExecutor
@@ -27,6 +27,7 @@ FALLBACK_TOKEN_FACTOR: int = 2
 LLM_TEMPERATURE: float = 0.0
 VECTOR_RETRIEVER_K: int = 4
 QUERY_TIMEOUT_SECONDS: float = 30.0  # Timeout for DuckDB queries
+CHAT_TIMEOUT_SECONDS: float = 30.0  # Timeout for agent execution
 SYSTEM_PROMPT: str = """You are a telemetry data analysis assistant. Use the provided tools to query telemetry data from DuckDB tables.
 Tables available: {tables}.
 
@@ -180,15 +181,17 @@ class TelemetryAgent:
     Attributes:
         session_id: Unique identifier for the session.
         db_path: Path to the DuckDB database file.
-        openai_api_key: OpenAI API key for LLM and embeddings.
+        openai_api_key: OpenAI API key for LLM.
         llm_model: Name of the LLM model (e.g., 'gpt-4o').
         token_encoder: TokenEncoder instance for counting tokens.
         max_tokens: Maximum tokens for LLM context window.
         max_context_tokens: Maximum tokens for context (excludes reserved response tokens).
         fallback_token_limit: Token limit for fallback memory strategy.
+        embeddings: OpenAIEmbeddings instance for vector store.
         llm: ChatOpenAI instance for language model interactions.
         prompt: ChatPromptTemplate for structuring LLM input.
         conversation_memory_manager: Manager for conversation history and memory strategies.
+        vector_store_manager: Manager for FAISS vector store operations.
         token_callback: Callback to track token usage.
         agent_chain: Runnable chain for processing queries with memory.
     """
@@ -201,6 +204,7 @@ class TelemetryAgent:
         llm_model: str,
         token_encoder: Any,
         vector_store_manager: VectorStoreManager,
+        embeddings: OpenAIEmbeddings,
         max_tokens: Optional[int] = None
     ) -> None:
         """Initialize TelemetryAgent with session and configuration details.
@@ -208,33 +212,55 @@ class TelemetryAgent:
         Args:
             session_id: Unique identifier for the session.
             db_path: Path to the DuckDB database file.
-            openai_api_key: OpenAI API key for LLM and embeddings.
+            openai_api_key: OpenAI API key for LLM.
             llm_model: Name of the LLM model (e.g., 'gpt-4o').
             token_encoder: TokenEncoder instance for counting tokens.
             vector_store_manager: Manager for FAISS vector store operations.
-            max_tokens: Maximum tokens for LLM context window (defaults to MAX_MODEL_TOKENS).
+            embeddings: Pre-initialized OpenAIEmbeddings instance.
+            max_tokens: Maximum tokens for LLM context window (defaults to None).
 
-        Raises:
-            ValueError: If token limits are invalid or exceed safety thresholds.
+        Note:
+            Call async_initialize to complete initialization of dependencies.
         """
         self.session_id: str = session_id
         self.db_path: str = db_path
-        self.logger = logger.bind(session_id=session_id)
         self.openai_api_key: str = openai_api_key
         self.llm_model: str = llm_model
         self.token_encoder: Any = token_encoder
-        self.max_tokens: int = max_tokens if max_tokens is not None else MAX_MODEL_TOKENS
-        self.max_context_tokens: int = self.max_tokens - RESERVED_RESPONSE_TOKENS
-        self.fallback_token_limit: int = self.max_context_tokens // FALLBACK_TOKEN_FACTOR
+        self.vector_store_manager: VectorStoreManager = vector_store_manager
+        self.embeddings: OpenAIEmbeddings = embeddings
+        self.max_tokens: Optional[int] = max_tokens
+        self.max_context_tokens: Optional[int] = None
+        self.fallback_token_limit: Optional[int] = None
+        self.llm: Optional[ChatOpenAI] = None
+        self.prompt: Optional[ChatPromptTemplate] = None
+        self.conversation_memory_manager: Optional[ConversationMemoryManager] = None
+        self.token_callback: Optional[TokenUsageCallback] = None
+        self.agent_chain: Optional[Any] = None
+        self.logger = logger.bind(session_id=session_id)
+
+    async def async_initialize(self) -> None:
+        """Asynchronously initialize TelemetryAgent dependencies.
+
+        Initializes token limits, LLM, prompt, conversation memory manager,
+        token callback, and agent chain.
+
+        Raises:
+            ValueError: If initialization fails due to invalid configuration.
+        """
+        # Set token limits
+        self.max_tokens = self.max_tokens if self.max_tokens is not None else MAX_MODEL_TOKENS
+        self.max_context_tokens = self.max_tokens - RESERVED_RESPONSE_TOKENS
+        self.fallback_token_limit = self.max_context_tokens // FALLBACK_TOKEN_FACTOR
 
         # Validate token configurations
-        self._validate_token_limits()
+        await asyncio.to_thread(self._validate_token_limits)
 
         # Initialize token usage callback
-        self.token_callback: TokenUsageCallback = TokenUsageCallback()
+        self.token_callback = TokenUsageCallback()
 
         # Initialize LLM with configured settings
-        self.llm: ChatOpenAI = ChatOpenAI(
+        self.llm = ChatOpenAI(
             model=self.llm_model,
             api_key=self.openai_api_key,
             temperature=LLM_TEMPERATURE,
@@ -243,43 +269,30 @@ class TelemetryAgent:
         )
 
         # Define system prompt for LLM
-        self.prompt: ChatPromptTemplate = ChatPromptTemplate.from_messages([
+        self.prompt = ChatPromptTemplate.from_messages([
             ("system", SYSTEM_PROMPT),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}")
         ])
 
         # Initialize conversation memory manager
-        self.conversation_memory_manager: ConversationMemoryManager = ConversationMemoryManager()
-        # Note: async_initialize must be called by the caller to complete initialization
-        self.vector_store_manager: VectorStoreManager = vector_store_manager
+        self.conversation_memory_manager = ConversationMemoryManager()
+        await self.conversation_memory_manager.async_initialize(
+            llm=self.llm,
+            model_name=self.llm_model,
+            llm_token_encoder=self.token_encoder,
+            max_context_tokens=self.max_context_tokens,
+            fallback_token_limit=self.fallback_token_limit,
+            embeddings=self.embeddings
+        )
 
         # Initialize agent chain with memory
-        memory, _ = self.conversation_memory_manager.get_memory()
+        memory, _ = await self.conversation_memory_manager.aget_memory()
         self.agent_chain = RunnableMap({
             "input": lambda x: x["input"],
             "chat_history": lambda _: memory.load_memory_variables({})["chat_history"],
             "tables": lambda _: self.get_tables_as_string(),
         }) | self.prompt | self.llm
-
-    async def async_initialize(self) -> None:
-        """Asynchronously complete initialization of ConversationMemoryManager.
-
-        Must be called after __init__ to initialize the conversation memory manager
-        with async dependencies.
-
-        Raises:
-            ValueError: If initialization fails due to invalid configuration.
-        """
-        await self.conversation_memory_manager.async_initialize(
-            llm=self.llm,
-            model_name=self.llm_model,
-            openai_api_key=self.openai_api_key,
-            llm_token_encoder=self.token_encoder,
-            max_context_tokens=self.max_context_tokens,
-            fallback_token_limit=self.fallback_token_limit,
-            vector_store_manager=self.vector_store_manager
-        )
 
     def _validate_token_limits(self) -> None:
         """Validate token-related configurations.
@@ -341,8 +354,8 @@ class TelemetryAgent:
                 - is_clarification: Whether the response requests clarification.
 
         Raises:
-            ValueError: If message processing fails or token limits are invalid.
-            asyncio.TimeoutError: If processing exceeds timeout (aligned with main.py's CHAT_TIMEOUT_SECONDS).
+            ValueError: If message processing fails, token limits are invalid, or agent is not initialized.
+            asyncio.TimeoutError: If processing exceeds CHAT_TIMEOUT_SECONDS.
         """
         if not message.strip():
             self.logger.warning("Empty message provided, skipping processing")
@@ -381,10 +394,10 @@ class TelemetryAgent:
             memory, memory_strategy = await self.conversation_memory_manager.aget_memory()
 
             # Perform vector store similarity search asynchronously
-            search_results = await self.conversation_memory_manager.asimilarity_search(
+            search_results = await self.vector_store_manager.asimilarity_search(
                 message, k=VECTOR_RETRIEVER_K
             )
-            relevant_tables: List[str] = [result.page_content.split(":")[0] for result in search_results]
+            relevant_tables: List[str] = [result.metadata.get("table", "") for result in search_results if result.metadata.get("table")]
             self.logger.info("Identified relevant tables", tables=relevant_tables)
 
             # Initialize agent with tools and memory
@@ -416,7 +429,7 @@ class TelemetryAgent:
 
             result = await asyncio.wait_for(
                 run_executor(),
-                timeout=30.0  # Align with main.py's CHAT_TIMEOUT_SECONDS
+                timeout=CHAT_TIMEOUT_SECONDS
             )
 
             # Process response and check for clarification needs
@@ -456,9 +469,9 @@ class TelemetryAgent:
             self.logger.error(
                 "Message processing timed out",
                 message=message,
-                timeout=30.0
+                timeout=CHAT_TIMEOUT_SECONDS
             )
-            raise ValueError("Message processing timed out after 30 seconds")
+            raise ValueError(f"Message processing timed out after {CHAT_TIMEOUT_SECONDS} seconds")
         except Exception as e:
             self.logger.error(
                 "Failed to process message",

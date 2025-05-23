@@ -11,11 +11,11 @@ class LLMTokenCounter:
     for various model encodings and comprehensive error handling.
     """
 
-    def __init__(self, model_name: str = "gpt-4o") -> None:
+    def __init__(self, model_name: str) -> None:
         """Initialize the LLMTokenCounter with a specific model.
 
         Args:
-            model_name: Name of the model for token encoding (default: 'gpt-4o').
+            model_name: Name of the model for token encoding.
 
         Raises:
             ValueError: If the model_name is invalid or unsupported by tiktoken.

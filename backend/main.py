@@ -18,6 +18,7 @@ from backend.telemetry_agent import TelemetryAgent
 from backend.telemetry_processor import TelemetryProcessor
 from backend.llm_token_counter import LLMTokenCounter
 from backend.vector_store_manager import VectorStoreManager
+from langchain_openai import OpenAIEmbeddings
 from backend.models import (
     ResponseStatus,
     ChatRequest,
@@ -105,9 +106,16 @@ except ValueError as e:
     logger.error("Failed to initialize LLMTokenCounter", error=str(e))
     raise ValueError(f"Failed to initialize LLMTokenCounter: {str(e)}") from e
 
+# Initialize OpenAIEmbeddings
+try:
+    embeddings: OpenAIEmbeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+except Exception as e:
+    logger.error("Failed to initialize OpenAIEmbeddings", error=str(e), exc_info=True)
+    raise ValueError(f"Failed to initialize OpenAIEmbeddings: {str(e)}") from e
+
 # Initialize VectorStoreManager
 try:
-    vector_store_manager: VectorStoreManager = VectorStoreManager(openai_api_key=OPENAI_API_KEY)
+    vector_store_manager: VectorStoreManager = VectorStoreManager(embeddings=embeddings)
     # Run initialization synchronously at startup to ensure vector store is ready
     loop = asyncio.get_event_loop()
     loop.run_until_complete(vector_store_manager.initialize())
@@ -130,8 +138,8 @@ app.add_middleware(
 # In-memory session, agent, and lock storage with global lock
 sessions: Dict[str, Session] = {}
 agents: Dict[str, TelemetryAgent] = {}
-session_locks: Dict[str, asyncio.Lock] = {}
-sessions_lock: asyncio.Lock = asyncio.Lock()
+per_session_locks: Dict[str, asyncio.Lock] = {}
+global_sessions_lock: asyncio.Lock = asyncio.Lock()
 
 async def validate_file(file: UploadFile) -> Tuple[str, str, int]:
     """Validate uploaded file and return sanitized filename, extension, and size.
@@ -304,7 +312,7 @@ async def create_session(
         status_message="Processing telemetry file",
     )
     sessions[session_id] = session
-    session_locks[session_id] = asyncio.Lock()
+    per_session_locks[session_id] = asyncio.Lock()
     logger.info(
         "Created session with PENDING status",
         session_id=session_id,
@@ -344,7 +352,7 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
             )
 
             # Create unique session ID
-            async with sessions_lock:
+            async with global_sessions_lock:
                 if len(sessions) >= MAX_SESSIONS:
                     logger.error("Maximum session limit reached", max_sessions=MAX_SESSIONS)
                     raise HTTPException(
@@ -444,10 +452,10 @@ async def initialize_agent(
             agent: TelemetryAgent = TelemetryAgent(
                 session_id=session_id,
                 db_path=db_path,
-                openai_api_key=OPENAI_API_KEY,
                 llm_model=LLM_MODEL,
                 token_encoder=token_counter,
                 vector_store_manager=vector_store_manager,
+                embeddings=embeddings,
             )
             await agent.async_initialize()
             agents[session_id] = agent
@@ -526,7 +534,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
-    async with sessions_lock:
+    async with global_sessions_lock:
         if request.session_id not in sessions:
             logger.error("Session not found", session_id=request.session_id)
             return ChatResponse(
@@ -538,7 +546,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
                 metadata=None,
                 request_duration=time.perf_counter() - start_time,
             )
-        session_lock = session_locks[request.session_id]
+        session_lock = per_session_locks[request.session_id]
 
     # Process message under session lock
     async with session_lock:
@@ -735,14 +743,14 @@ async def export_chat(session_id: str) -> StreamingResponse:
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
-    async with sessions_lock:
+    async with global_sessions_lock:
         if session_id not in sessions:
             logger.error("Session not found", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
             )
-        session_lock = session_locks[session_id]
+        session_lock = per_session_locks[session_id]
 
     # Export messages
     async with session_lock:
@@ -808,14 +816,14 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
-    async with sessions_lock:
+    async with global_sessions_lock:
         if session_id not in sessions:
             logger.error("Session not found", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
             )
-        session_lock = session_locks[session_id]
+        session_lock = per_session_locks[session_id]
 
     # Delete session data
     async with session_lock:
@@ -835,7 +843,7 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
 
             # Remove session and lock
             del sessions[session_id]
-            del session_locks[session_id]
+            del per_session_locks[session_id]
             logger.info(
                 "Deleted session",
                 session_id=session_id,
