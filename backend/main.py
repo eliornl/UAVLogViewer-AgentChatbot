@@ -1,33 +1,47 @@
-"""FastAPI application for uploading, parsing, and analyzing flight log files.
-
-Supports uploading .bin/.tlog files, storing telemetry in DuckDB, and managing chat sessions.
-"""
-
 import os
 import uuid
-import enum
 import asyncio
 import duckdb
 import structlog
-import pandas as pd
-import re
-import tempfile
-import logging
+import time
+import aiofiles
+import mimetypes
+import json
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Union, Any, Tuple
+from typing import Dict, List, Set, Optional, AsyncGenerator, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse
+from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
-from pymavlink import mavutil
-import mimetypes
+from backend.telemetry_agent import TelemetryAgent
+from backend.telemetry_processor import TelemetryProcessor
+from backend.llm_token_counter import LLMTokenCounter
+from backend.vector_store_manager import VectorStoreManager
+from backend.models import (
+    ResponseStatus,
+    ChatRequest,
+    UploadResponse,
+    ChatResponse,
+    DeleteSessionResponse,
+    Session,
+    Message,
+    SessionStatus,
+)
 
-# Configure structlog for structured logging with session_id context
+# Constants
+ALLOWED_EXTENSIONS: Set[str] = {".bin", ".tlog"}
+JSON_MEDIA_TYPE: str = "application/json"
+TEXT_MEDIA_TYPE: str = "text/plain"
+MAX_MESSAGES: int = 10_000  # Limit messages per session to prevent memory issues
+FILENAME_SAFE_CHARS: str = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+
+# Configure structlog for structured logging
 structlog.configure(
     processors=[
         structlog.processors.TimeStamper(fmt="iso"),
         structlog.stdlib.add_log_level,
-        structlog.processors.JSONRenderer()
+        structlog.processors.JSONRenderer(),
     ],
     context_class=dict,
     logger_factory=structlog.stdlib.LoggerFactory(),
@@ -36,27 +50,10 @@ structlog.configure(
 )
 logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 
-# Load environment variables from .env file for configuration
+# Load environment variables
 load_dotenv()
 
-# Environment variables:
-# - ALLOWED_ORIGINS: Comma-separated CORS origins (e.g., "http://localhost:8080")
-# - ALLOWED_METHODS: Allowed HTTP methods (e.g., "GET,POST,DELETE,OPTIONS")
-# - ALLOWED_HEADERS: Allowed headers (e.g., "Content-Type,Authorization")
-# - ALLOW_CREDENTIALS: Enable credentials (true/false)
-# - MAX_FILE_SIZE_MB: Max upload size in MB (e.g., 100)
-# - STORAGE_DIR: Directory for DuckDB files (e.g., "./storage")
-# - CHUNK_SIZE: File read chunk size in bytes (e.g., 1048576)
-# - LOG_LEVEL: Logging level (e.g., "INFO", "DEBUG")
-# - MAX_SESSION_ATTEMPTS: Max session ID generation attempts (e.g., 5)
-# - DUCKDB_FILE_PREFIX: Prefix for DuckDB files (e.g., "" or "telemetry_")
-# - ALLOWED_MIME_TYPES: Comma-separated MIME types (e.g., "application/octet-stream,text/plain")
-# - SESSION_TTL: Session expiration time in seconds (e.g., 86400 for 24 hours)
-
-# Initialize FastAPI application
-app: FastAPI = FastAPI()
-
-# Configure application settings from environment variables
+# Environment variables with type hints
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080").split(",")
 ALLOWED_METHODS: List[str] = os.getenv("ALLOWED_METHODS", "GET,POST,DELETE,OPTIONS").split(",")
 ALLOWED_HEADERS: List[str] = os.getenv("ALLOWED_HEADERS", "Content-Type,Authorization").split(",")
@@ -67,29 +64,61 @@ CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1048576"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 MAX_SESSION_ATTEMPTS: int = int(os.getenv("MAX_SESSION_ATTEMPTS", "5"))
 DUCKDB_FILE_PREFIX: str = os.getenv("DUCKDB_FILE_PREFIX", "")
-ALLOWED_MIME_TYPES: Set[str] = set(os.getenv("ALLOWED_MIME_TYPES", "application/octet-stream,text/plain").split(","))
-SESSION_TTL: int = int(os.getenv("SESSION_TTL", "86400"))
+ALLOWED_MIME_TYPES: Set[str] = set(
+    os.getenv("ALLOWED_MIME_TYPES", "application/octet-stream,text/plain").split(",")
+)
+OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
+CHAT_TIMEOUT_SECONDS: float = float(os.getenv("CHAT_TIMEOUT_SECONDS", "30"))
+MAX_SESSIONS: int = int(os.getenv("MAX_SESSIONS", "1000"))
 
-# Configure logging level
-logging.getLogger().setLevel(LOG_LEVEL)
+# Validate environment variables
+def validate_env_vars() -> None:
+    """Validate environment variables and raise ValueError if invalid."""
+    if not OPENAI_API_KEY:
+        logger.error("OPENAI_API_KEY is not set")
+        raise ValueError("OPENAI_API_KEY must be set in .env")
+    if CHAT_TIMEOUT_SECONDS <= 0:
+        logger.error("CHAT_TIMEOUT_SECONDS must be positive")
+        raise ValueError("CHAT_TIMEOUT_SECONDS must be positive")
+    if MAX_SESSIONS <= 0:
+        logger.error("MAX_SESSIONS must be positive")
+        raise ValueError("MAX_SESSIONS must be positive")
+    if ".." in os.path.relpath(STORAGE_DIR):
+        logger.error("STORAGE_DIR contains parent directory references")
+        raise ValueError("STORAGE_DIR cannot contain parent directory references")
+    if not os.path.exists(STORAGE_DIR):
+        os.makedirs(STORAGE_DIR, exist_ok=True)
+    if not os.path.isdir(STORAGE_DIR) or not os.access(STORAGE_DIR, os.W_OK):
+        logger.error("STORAGE_DIR is not a writable directory", storage_dir=STORAGE_DIR)
+        raise ValueError(f"STORAGE_DIR '{STORAGE_DIR}' is not a writable directory")
+    if ALLOW_CREDENTIALS and "*" in ALLOWED_ORIGINS:
+        logger.error("Credentials cannot be used with wildcard origins")
+        raise ValueError("Credentials cannot be used with wildcard origins")
 
-# Validate STORAGE_DIR
-if ".." in os.path.relpath(STORAGE_DIR, os.getcwd()):
-    raise ValueError("STORAGE_DIR cannot contain parent directory references")
-if not os.path.exists(STORAGE_DIR):
-    os.makedirs(STORAGE_DIR, exist_ok=True)
-if not os.path.isdir(STORAGE_DIR):
-    raise ValueError(f"STORAGE_DIR '{STORAGE_DIR}' is not a directory")
-if not os.access(STORAGE_DIR, os.W_OK):
-    raise ValueError(f"STORAGE_DIR '{STORAGE_DIR}' is not writable")
+validate_env_vars()
 
-# Validate CORS settings for security
-if ALLOW_CREDENTIALS and "*" in ALLOWED_ORIGINS:
-    raise ValueError("Credentials cannot be used with wildcard origins")
-if not any(ALLOWED_ORIGINS) or all(not origin.strip() for origin in ALLOWED_ORIGINS):
-    raise ValueError("ALLOWED_ORIGINS must specify valid origins")
+# Initialize LLMTokenCounter
+try:
+    token_counter: LLMTokenCounter = LLMTokenCounter(model_name=LLM_MODEL)
+except ValueError as e:
+    logger.error("Failed to initialize LLMTokenCounter", error=str(e))
+    raise ValueError(f"Failed to initialize LLMTokenCounter: {str(e)}") from e
 
-# Apply CORS middleware to enable cross-origin requests from frontend
+# Initialize VectorStoreManager
+try:
+    vector_store_manager: VectorStoreManager = VectorStoreManager(openai_api_key=OPENAI_API_KEY)
+    # Run initialization synchronously at startup to ensure vector store is ready
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(vector_store_manager.initialize())
+except Exception as e:
+    logger.error("Failed to initialize VectorStoreManager", error=str(e), exc_info=True)
+    raise ValueError(f"Failed to initialize VectorStoreManager: {str(e)}") from e
+
+# Initialize FastAPI app
+app: FastAPI = FastAPI(title="AeroTelemetry AI Analysis API")
+
+# Apply CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -98,304 +127,11 @@ app.add_middleware(
     allow_headers=ALLOWED_HEADERS,
 )
 
-# Lock for thread-safe access to sessions
-sessions_lock: asyncio.Lock = asyncio.Lock()
-
-# Relevant telemetry message types for parsing
-RELEVANT_TELEMETRY_MESSAGES: List[str] = [
-    'ATTITUDE',
-    'GLOBAL_POSITION_INT',
-    'VFR_HUD',
-    'SYS_STATUS',
-    'STATUSTEXT',
-    'RC_CHANNELS',
-    'GPS_RAW_INT',
-    'BATTERY_STATUS',
-    'EKF_STATUS_REPORT'
-]
-
-# Enum for API response status
-class Status(str, enum.Enum):
-    """Status codes for API responses."""
-    SUCCESS = "SUCCESS"
-    ERROR = "ERROR"
-
-# Pydantic models for request and response validation
-class Message(BaseModel):
-    """Chat message details for a session."""
-    message_id: str
-    user_message: str
-    chat_response: str
-    timestamp: datetime
-
-class Session(BaseModel):
-    """Session data for a flight log, including messages."""
-    session_id: str
-    created_at: datetime
-    file_name: str
-    file_size: int
-    messages: List[Message] = Field(default_factory=list)
-
-class ChatRequest(BaseModel):
-    """Payload for sending chat messages to the FlightAgent."""
-    session_id: str
-    message: str
-
-class UploadResponse(BaseModel):
-    """Response for file upload and session creation."""
-    timestamp: datetime
-    file_name: str
-    file_size: int
-    session_id: str
-    status: Status
-    message: str
-
-class DeleteSessionResponse(BaseModel):
-    """Response for session deletion."""
-    timestamp: datetime
-    session_id: str
-    status: Status
-    message: str
-
-class ExportChatResponse(BaseModel):
-    """Response for exporting chat history."""
-    timestamp: datetime
-    session_id: str
-    status: Status
-    messages: List[Message]
-
-class HealthResponse(BaseModel):
-    """Response for health check."""
-    timestamp: datetime
-    status: Status
-    message: str
-    details: Dict[str, bool]
-
-# In-memory session storage: mapping session_id to Session
+# In-memory session, agent, and lock storage with global lock
 sessions: Dict[str, Session] = {}
-
-# Utility functions
-def validate_uuid(session_id: str) -> None:
-    """Validate that session_id is a valid UUID.
-
-    Args:
-        session_id: Session ID to validate.
-
-    Raises:
-        HTTPException: If session_id is not a valid UUID.
-    """
-    try:
-        uuid_obj = uuid.UUID(session_id)
-        if str(uuid_obj) != session_id:
-            raise ValueError
-    except ValueError:
-        logger.error("Invalid UUID format", session_id=session_id)
-        raise HTTPException(status_code=400, detail="Invalid session_id format; must be a valid UUID")
-
-async def cleanup_temp_file(tmp_file_path: str, logger: structlog.stdlib.BoundLogger, file_name: str = "") -> None:
-    """Clean up a temporary file and log the result.
-
-    Args:
-        tmp_file_path: Path to the temporary file.
-        logger: Logger instance for logging cleanup status.
-        file_name: Optional filename for logging context.
-    """
-    try:
-        os.unlink(tmp_file_path)
-        logger.info("Cleaned up temporary file", file_name=file_name, tmp_file_path=tmp_file_path)
-    except OSError as e:
-        logger.warning("Failed to clean up temporary file", file_name=file_name, tmp_file_path=tmp_file_path, error=str(e))
-
-# Placeholder class for telemetry parsing and DuckDB storage
-class TelemetryProcessor:
-    """Processes flight log files and saves telemetry data to DuckDB."""
-    
-    @staticmethod
-    def map_dtype(dtype: Any) -> str:
-        """Map pandas dtype to DuckDB column type.
-
-        Args:
-            dtype: Pandas data type to map.
-
-        Returns:
-            str: Corresponding DuckDB column type (e.g., 'BIGINT', 'VARCHAR').
-        """
-        if pd.api.types.is_integer_dtype(dtype):
-            return "BIGINT"
-        elif pd.api.types.is_float_dtype(dtype):
-            return "DOUBLE"
-        elif pd.api.types.is_bool_dtype(dtype):
-            return "BOOLEAN"
-        elif pd.api.types.is_datetime64_any_dtype(dtype):
-            return "TIMESTAMP"
-        elif pd.api.types.is_timedelta64_dtype(dtype):
-            return "INTERVAL"
-        else:
-            return "VARCHAR"
-    
-    @staticmethod
-    async def parse_and_save(file_path: str, session_id: str, sanitized_filename: str) -> None:
-        """Parse flight log file and save telemetry data to DuckDB.
-
-        Creates per-session DuckDB file in STORAGE_DIR with tables for each telemetry message type.
-
-        Args:
-            file_path: Path to the temporary file containing the flight log.
-            session_id: Unique session ID for associating telemetry data.
-            sanitized_filename: Sanitized filename for logging.
-
-        Raises:
-            ValueError: If file parsing fails (e.g., invalid telemetry file).
-            OSError: If file read fails.
-            duckdb.Error: If DuckDB operation fails.
-
-        Returns:
-            None
-        """
-        try:
-            # Parse .bin file using pymavlink
-            try:
-                mav = mavutil.mavlogfile(file_path, zero_time_base=True)
-            except Exception as e:
-                logger.error("Failed to initialize MAVLink file", file_name=sanitized_filename, session_id=session_id, error=str(e))
-                raise ValueError(f"Invalid telemetry file: {str(e)}")
-            
-            # Initialize dictionaries for each message type
-            telemetry_data: Dict[str, List[Dict[str, Any]]] = {msg_type: [] for msg_type in RELEVANT_TELEMETRY_MESSAGES}
-            
-            # Parse messages
-            while True:
-                try:
-                    msg = mav.recv_msg()
-                    if msg is None:
-                        break
-                    msg_type = msg.get_type()
-                    if msg_type in RELEVANT_TELEMETRY_MESSAGES:
-                        msg_dict = msg.to_dict()
-                        # Add timestamp (MAVLink timestamp or current time)
-                        msg_dict['timestamp'] = getattr(msg, '_timestamp', datetime.now(timezone.utc).timestamp())
-                        telemetry_data[msg_type].append(msg_dict)
-                except Exception as e:
-                    logger.warning("Error parsing message", file_name=sanitized_filename, session_id=session_id, error=str(e))
-                    continue
-            
-            # Create storage directory and connect to per-session DuckDB
-            os.makedirs(STORAGE_DIR, exist_ok=True)
-            db_path = os.path.join(STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb")
-            with duckdb.connect(db_path) as conn:
-                # Store data in DuckDB tables
-                for msg_type, messages in telemetry_data.items():
-                    if not messages:
-                        logger.info("No messages found for type", msg_type=msg_type, file_name=sanitized_filename, session_id=session_id)
-                        continue
-                    
-                    # Convert to pandas DataFrame
-                    messages: List[Dict[str, Any]]
-                    df: pd.DataFrame = pd.DataFrame(messages)
-                    
-                    # Create sanitized table name
-                    table_name = f"telemetry_{re.sub(r'[^a-z0-9_]', '_', msg_type.lower())}"
-                    
-                    # Prepare columns, excluding mavpackettype
-                    if 'mavpackettype' in df.columns:
-                        df = df.drop(columns=['mavpackettype'])
-                    columns = [f"{col} {TelemetryProcessor.map_dtype(df[col].dtype)}" for col in df.columns]
-                    
-                    # Create table
-                    create_table_query = f"""
-                    CREATE TABLE {table_name} (
-                        {', '.join(columns)}
-                    )
-                    """
-                    conn.execute(create_table_query)
-                    
-                    # Insert data into DuckDB
-                    conn.execute(f"INSERT INTO {table_name} SELECT * FROM df", {'df': df})
-                    
-                    logger.info("Saved telemetry data", table_name=table_name, row_count=len(df), file_name=sanitized_filename, session_id=session_id)
-            
-        except OSError as e:
-            logger.error("File read error", file_name=sanitized_filename, session_id=session_id, error=str(e))
-            raise
-        except duckdb.Error as e:
-            logger.error("DuckDB error", file_name=sanitized_filename, session_id=session_id, error=str(e))
-            raise
-        except ValueError as e:
-            logger.error("Parsing failed", file_name=sanitized_filename, session_id=session_id, error=str(e))
-            raise
-        except Exception as e:
-            logger.exception("Unexpected error", file_name=sanitized_filename, session_id=session_id, error_type=type(e).__name__)
-            raise HTTPException(status_code=500, detail="Internal server error")
-
-# API Endpoints
-@app.get("/health")
-async def health_check() -> HealthResponse:
-    """Check the health of the API, including storage and DuckDB connectivity.
-
-    Returns:
-        HealthResponse: Response with timestamp, status, message, and check details (storage_writable, duckdb_writable, duckdb_connection).
-    """
-    timestamp = datetime.now(timezone.utc)
-    details: Dict[str, bool] = {}
-    status = Status.SUCCESS
-    message = "API is healthy"
-
-    # Check storage directory accessibility
-    try:
-        if not os.path.exists(STORAGE_DIR):
-            await asyncio.to_thread(os.makedirs, STORAGE_DIR, exist_ok=True)
-        storage_writable = await asyncio.to_thread(os.access, STORAGE_DIR, os.W_OK)
-        details["storage_writable"] = storage_writable
-        if not storage_writable:
-            logger.error("Storage directory is not writable", storage_dir=STORAGE_DIR)
-            status = Status.ERROR
-            message = "Health check failed"
-    except Exception as e:
-        logger.error("Storage check failed", storage_dir=STORAGE_DIR, error=str(e))
-        details["storage_writable"] = False
-        status = Status.ERROR
-        message = "Health check failed"
-
-    # Check DuckDB connectivity and file writability
-    with tempfile.NamedTemporaryFile(suffix=".duckdb", dir=STORAGE_DIR, delete=False) as temp_file:
-        temp_db_path = temp_file.name
-        try:
-            # Validate DuckDB file writability
-            duckdb_writable = await asyncio.to_thread(os.access, temp_db_path, os.W_OK)
-            details["duckdb_writable"] = duckdb_writable
-            if not duckdb_writable:
-                logger.error("DuckDB file is not writable", db_path=temp_db_path)
-                status = Status.ERROR
-                message = "Health check failed"
-
-            # Only attempt connection if file is writable
-            if duckdb_writable:
-                with duckdb.connect(temp_db_path) as conn:
-                    conn.execute("SELECT 1")
-                details["duckdb_connection"] = True
-            else:
-                details["duckdb_connection"] = False
-                status = Status.ERROR
-                message = "Health check failed"
-        except duckdb.Error as e:
-            logger.error("DuckDB connection failed", db_path=temp_db_path, error=str(e))
-            details["duckdb_connection"] = False
-            status = Status.ERROR
-            message = "Health check failed"
-        finally:
-            await cleanup_temp_file(temp_db_path, logger)
-
-    if status == Status.SUCCESS:
-        logger.info("Health check passed", details=details)
-    else:
-        logger.error("Health check failed", details=details)
-
-    return HealthResponse(
-        timestamp=timestamp,
-        status=status,
-        message=message,
-        details=details
-    )
+agents: Dict[str, TelemetryAgent] = {}
+session_locks: Dict[str, asyncio.Lock] = {}
+sessions_lock: asyncio.Lock = asyncio.Lock()
 
 async def validate_file(file: UploadFile) -> Tuple[str, str, int]:
     """Validate uploaded file and return sanitized filename, extension, and size.
@@ -407,214 +143,732 @@ async def validate_file(file: UploadFile) -> Tuple[str, str, int]:
         Tuple[str, str, int]: Sanitized filename, file extension, and file size.
 
     Raises:
-        HTTPException: If validation fails.
+        HTTPException: If file is invalid, empty, too large, or has invalid type/extension.
     """
     if not file or not file.filename:
         logger.error("No file provided")
-        raise HTTPException(status_code=400, detail="No file provided")
-    
-    sanitized_filename = "".join(c if c.isalnum() or c in ".-_" else "_" for c in os.path.basename(file.filename))
-    allowed_extensions = {".bin", ".tlog"}
-    file_ext = os.path.splitext(sanitized_filename)[1].lower()
-    if file_ext not in allowed_extensions:
-        logger.error("Invalid file extension", file_name=sanitized_filename, ext=file_ext)
-        raise HTTPException(status_code=400, detail=f"Invalid file extension. Allowed: {allowed_extensions}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
 
+    sanitized_filename: str = "".join(
+        c if c.isalnum() or c in ".-_" else "_" for c in os.path.basename(file.filename)
+    )
+    file_ext: str = os.path.splitext(sanitized_filename)[1].lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        logger.error("Invalid file extension", file_name=sanitized_filename, ext=file_ext)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid file extension. Allowed: {ALLOWED_EXTENSIONS}",
+        )
+
+    mime_type: Optional[str]
     mime_type, _ = mimetypes.guess_type(file.filename)
     if mime_type is None or mime_type not in ALLOWED_MIME_TYPES:
         logger.error("Invalid MIME type", file_name=sanitized_filename, mime_type=mime_type)
-        raise HTTPException(status_code=400, detail=f"Invalid MIME type. Allowed: {ALLOWED_MIME_TYPES}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid MIME type. Allowed: {ALLOWED_MIME_TYPES}",
+        )
 
-    file_size = file.size
-    if file_size is None:
-        try:
-            file_size = 0
-            await file.seek(0)
-            async for chunk in file:
-                file_size += len(chunk)
-            await file.seek(0)
-        except OSError as e:
-            logger.error("File streaming error", file_name=sanitized_filename, error=str(e))
-            raise HTTPException(status_code=400, detail=f"File streaming error: {str(e)}")
-    
+    file_size: int = file.size or 0
+    if file_size == 0:
+        await file.seek(0)
+        async for chunk in file:
+            file_size += len(chunk)
+        await file.seek(0)
+
     if file_size == 0:
         logger.error("Empty file provided", file_name=sanitized_filename)
-        raise HTTPException(status_code=400, detail="Empty file provided")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file provided")
     if file_size > MAX_FILE_SIZE:
-        logger.error("File size exceeds maximum", file_name=sanitized_filename, size=file_size, max_size=MAX_FILE_SIZE)
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=f"File size exceeds maximum {MAX_FILE_SIZE/1024/1024}MB")
+        logger.error(
+            "File size exceeds maximum",
+            file_name=sanitized_filename,
+            size=file_size,
+            max_size=MAX_FILE_SIZE,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum {MAX_FILE_SIZE/1024/1024}MB",
+        )
 
     return sanitized_filename, file_ext, file_size
 
 async def process_file(file: UploadFile, tmp_file_path: str) -> None:
-    """Write uploaded file to temporary file using chunked reading.
+    """Write uploaded file to temporary file using async I/O.
 
     Args:
-        file: Uploaded file to process.
+        file: Uploaded file to write.
         tmp_file_path: Path to temporary file.
 
     Raises:
-        OSError: If file writing fails.
+        HTTPException: If file write fails due to I/O error.
     """
-    with open(tmp_file_path, "wb") as tmp_file:
-        await file.seek(0)
-        while chunk := await file.read(CHUNK_SIZE):
-            tmp_file.write(chunk)
+    try:
+        async with aiofiles.open(tmp_file_path, "wb") as tmp_file:
+            await file.seek(0)
+            while chunk := await file.read(CHUNK_SIZE):  # type: bytes
+                await tmp_file.write(chunk)
+    except OSError as e:
+        logger.error("File write error", tmp_file_path=tmp_file_path, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process file"
+        )
+
+def validate_uuid(session_id: str) -> None:
+    """Validate that session_id is a valid UUID.
+
+    Args:
+        session_id: Session ID to validate.
+
+    Raises:
+        HTTPException: If session_id is not a valid UUID.
+    """
+    try:
+        uuid_obj: uuid.UUID = uuid.UUID(session_id, version=4)
+        if str(uuid_obj) != session_id:
+            raise ValueError
+    except ValueError:
+        logger.error("Invalid UUID format", session_id=session_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid session_id format; must be a valid UUID",
+        )
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
+async def cleanup_temp_file(
+    tmp_file_path: str, logger: structlog.stdlib.BoundLogger, file_name: Optional[str] = None
+) -> None:
+    """Clean up a temporary file with retries.
+
+    Args:
+        tmp_file_path: Path to temporary file.
+        logger: Logger instance for logging cleanup events.
+        file_name: Optional filename for logging context.
+
+    Raises:
+        OSError: If cleanup fails after retries, re-raises the specific OSError.
+    """
+    try:
+        if os.path.exists(tmp_file_path):
+            await asyncio.to_thread(os.unlink, tmp_file_path)
+            logger.info(
+                "Cleaned up temporary file",
+                file_name=file_name or "",
+                tmp_file_path=tmp_file_path,
+            )
+    except OSError as e:
+        logger.warning(
+            "Failed to clean up temporary file",
+            file_name=file_name or "",
+            tmp_file_path=tmp_file_path,
+            error=str(e),
+        )
+        # Explicitly re-raise OSError for tenacity retry
+        raise OSError(f"Failed to delete temporary file {tmp_file_path}: {str(e)}") from e
+
+def generate_filename(session_id: str, extension: str) -> str:
+    """Generate a safe filename for export.
+
+    Args:
+        session_id: Session ID to include in filename.
+        extension: File extension (e.g., '.json').
+
+    Returns:
+        str: Safe filename like 'chat_{session_id}_{timestamp}{extension}'.
+    """
+    export_timestamp: str = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    safe_session_id: str = "".join(
+        c if c.lower() in FILENAME_SAFE_CHARS else "_" for c in session_id
+    )
+    return f"chat_{safe_session_id}_{export_timestamp}{extension}"
+
+async def create_session(
+    sanitized_filename: str, file_size: int, session_id: str
+) -> Session:
+    """Create a new session with PENDING status.
+
+    Args:
+        sanitized_filename: Sanitized name of uploaded file.
+        file_size: Size of uploaded file in bytes.
+        session_id: Unique session ID.
+
+    Returns:
+        Session: New session object.
+    """
+    session: Session = Session(
+        session_id=session_id,
+        created_at=datetime.now(timezone.utc),
+        file_name=sanitized_filename,
+        file_size=file_size,
+        status=SessionStatus.PENDING,
+        status_message="Processing telemetry file",
+    )
+    sessions[session_id] = session
+    session_locks[session_id] = asyncio.Lock()
+    logger.info(
+        "Created session with PENDING status",
+        session_id=session_id,
+        file_name=sanitized_filename,
+        file_size=file_size,
+    )
+    return session
 
 @app.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
 async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
-    """Upload a flight log file, parse it, and create a new session with a UUID.
+    """Upload a flight log file, parse it, and create a new session.
 
     Args:
-        file: Flight log file uploaded by the client (.bin or .tlog).
+        file: Flight log file (.bin or .tlog) to upload.
 
     Returns:
-        UploadResponse: Response with timestamp, file_name, file_size, session_id, status, and message.
+        UploadResponse: Response with session ID, file details, and processing status.
 
     Raises:
-        HTTPException: If file is invalid, exceeds size limit, or processing fails.
+        HTTPException: If file is invalid, too large, or processing fails.
     """
+    start_time: float = time.perf_counter()
+    sanitized_filename: str
+    file_ext: str
+    file_size: int
     sanitized_filename, file_ext, file_size = await validate_file(file)
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as tmp_file:
-        tmp_file_path = tmp_file.name
+    async with aiofiles.tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as tmp_file:
+        tmp_file_path: str = tmp_file.name
         try:
             await process_file(file, tmp_file_path)
-            logger.info("Created temporary file", file_name=sanitized_filename, tmp_file_path=tmp_file_path, file_size=file_size)
-            
+            logger.info(
+                "Created temporary file",
+                file_name=sanitized_filename,
+                tmp_file_path=tmp_file_path,
+                file_size=file_size,
+            )
+
+            # Create unique session ID
             async with sessions_lock:
+                if len(sessions) >= MAX_SESSIONS:
+                    logger.error("Maximum session limit reached", max_sessions=MAX_SESSIONS)
+                    raise HTTPException(
+                        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail="Maximum session limit reached",
+                    )
+
                 session_id: str = str(uuid.uuid4())
-                attempt = 0
+                attempt: int = 0
                 while session_id in sessions and attempt < MAX_SESSION_ATTEMPTS:
-                    logger.warning("Session ID already exists, generating new ID", session_id=session_id, attempt=attempt)
+                    logger.warning(
+                        "Session ID collision", session_id=session_id, attempt=attempt
+                    )
                     session_id = str(uuid.uuid4())
                     attempt += 1
                 if session_id in sessions:
-                    logger.error("Failed to generate unique session ID", session_id=session_id, max_attempts=MAX_SESSION_ATTEMPTS)
-                    raise HTTPException(status_code=500, detail="Failed to generate unique session ID")
+                    logger.error(
+                        "Failed to generate unique session ID",
+                        max_attempts=MAX_SESSION_ATTEMPTS,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Failed to generate unique session ID",
+                    )
 
-                db_path = os.path.join(STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb")
-                if os.path.exists(db_path):
-                    logger.error("DuckDB file already exists", session_id=session_id, db_path=db_path)
-                    raise HTTPException(status_code=409, detail="Session ID conflict")
-
+                session: Session = await create_session(
+                    sanitized_filename, file_size, session_id
+                )
                 logger = logger.bind(session_id=session_id)
+                db_path: str = os.path.join(
+                    STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb"
+                )
+                if os.path.exists(db_path):
+                    logger.error("DuckDB file already exists", db_path=db_path)
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT, detail="Session ID conflict"
+                    )
 
-                try:
-                    logger.info("Starting file parsing", file_name=sanitized_filename, session_id=session_id, file_size=file_size)
-                    await TelemetryProcessor.parse_and_save(tmp_file_path, session_id, sanitized_filename)
-                    
-                    session = Session(
-                        session_id=session_id,
-                        created_at=datetime.now(timezone.utc),
-                        file_name=sanitized_filename,
-                        file_size=file_size,
-                        messages=[]
-                    )
-                    sessions[session_id] = session
-                    logger.info("Created session", file_name=sanitized_filename, file_size=file_size)
-                    
-                    return UploadResponse(
-                        timestamp=session.created_at,
-                        file_name=sanitized_filename,
-                        file_size=file_size,
-                        session_id=session_id,
-                        status=Status.SUCCESS,
-                        message="File uploaded and processed successfully"
-                    )
-                except ValueError as e:
-                    logger.error("Parsing failed, session not created", file_name=sanitized_filename, session_id=session_id, error=str(e))
-                    raise HTTPException(status_code=400, detail=f"File parsing failed: {str(e)}")
-                except OSError as e:
-                    logger.error("File read error, session not created", file_name=sanitized_filename, session_id=session_id, error=str(e))
-                    raise HTTPException(status_code=400, detail=f"File read error: {str(e)}")
-                except duckdb.Error as e:
-                    logger.error("DuckDB error, session not created", file_name=sanitized_filename, session_id=session_id, error=str(e))
-                    raise HTTPException(status_code=500, detail="Database error")
-                except Exception as e:
-                    logger.exception("Unexpected error, session not created", file_name=sanitized_filename, session_id=session_id, error_type=type(e).__name__)
-                    raise HTTPException(status_code=500, detail="Internal server error")
+            try:
+                await TelemetryProcessor.parse_and_save(
+                    tmp_file_path, session, STORAGE_DIR, DUCKDB_FILE_PREFIX
+                )
+                logger.info(
+                    "Session processing completed",
+                    session_status=session.status,
+                    status_message=session.status_message,
+                )
+                return UploadResponse(
+                    timestamp=session.created_at,
+                    file_name=sanitized_filename,
+                    file_size=file_size,
+                    session_id=session_id,
+                    status=ResponseStatus.SUCCESS,
+                    message=session.status_message or "File uploaded and processed successfully",
+                    request_duration=time.perf_counter() - start_time,
+                )
+            except ValueError as e:
+                logger.error("Parsing failed", error=str(e), exc_info=True)
+                return UploadResponse(
+                    timestamp=session.created_at,
+                    file_name=sanitized_filename,
+                    file_size=file_size,
+                    session_id=session_id,
+                    status=ResponseStatus.ERROR,
+                    message=session.status_message or f"File parsing failed: {str(e)}",
+                    request_duration=time.perf_counter() - start_time,
+                )
+            except (OSError, duckdb.IOException) as e:
+                logger.error("File or database error", error=str(e), exc_info=True)
+                return UploadResponse(
+                    timestamp=session.created_at,
+                    file_name=sanitized_filename,
+                    file_size=file_size,
+                    session_id=session_id,
+                    status=ResponseStatus.ERROR,
+                    message=session.status_message or f"File or database error: {str(e)}",
+                    request_duration=time.perf_counter() - start_time,
+                )
         finally:
             await cleanup_temp_file(tmp_file_path, logger, sanitized_filename)
 
-@app.post("/chat")
-async def chat_message(request: ChatRequest) -> Dict[str, Union[str, dict]]:
-    """Send a user message to the FlightAgent for a session (to be implemented)."""
-    raise HTTPException(status_code=501, detail="Chat functionality not implemented")
-
-@app.delete("/session/{session_id}")
-async def delete_session(session_id: str) -> DeleteSessionResponse:
-    """Delete a session and free its resources, including associated DuckDB files.
+async def initialize_agent(
+    session_id: str, db_path: str, start_time: float
+) -> Optional[TelemetryAgent]:
+    """Initialize or retrieve a TelemetryAgent for a session.
 
     Args:
-        session_id: Unique UUID of the session to delete.
+        session_id: Session ID for the agent.
+        db_path: Path to DuckDB file for the session.
+        start_time: Request start time for duration tracking.
 
     Returns:
-        DeleteSessionResponse: Response with timestamp, session_id, status, and message.
+        Optional[TelemetryAgent]: Initialized or existing agent, or None if initialization fails.
+    """
+    if session_id not in agents:
+        try:
+            agent: TelemetryAgent = TelemetryAgent(
+                session_id=session_id,
+                db_path=db_path,
+                openai_api_key=OPENAI_API_KEY,
+                llm_model=LLM_MODEL,
+                token_encoder=token_counter,
+                vector_store_manager=vector_store_manager,
+            )
+            await agent.async_initialize()
+            agents[session_id] = agent
+            logger.info("Initialized new TelemetryAgent for session", session_id=session_id)
+            return agent
+        except Exception as e:
+            logger.error(
+                "Failed to initialize TelemetryAgent",
+                session_id=session_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return None
+    logger.debug("Retrieved existing TelemetryAgent for session", session_id=session_id)
+    return agents[session_id]
+
+async def handle_session_error(
+    session: Session, session_id: str, message_id: str, start_time: float
+) -> Optional[ChatResponse]:
+    """Handle session error states (ERROR or PENDING).
+
+    Args:
+        session: Session object to check.
+        session_id: Session ID for response.
+        message_id: Message ID for response.
+        start_time: Request start time for duration.
+
+    Returns:
+        Optional[ChatResponse]: Error response if session is in error state, else None.
+    """
+    if session.status == SessionStatus.ERROR:
+        logger.info(
+            "Session has an error",
+            session_id=session_id,
+            status_message=session.status_message,
+        )
+        return ChatResponse(
+            timestamp=datetime.now(timezone.utc),
+            session_id=session_id,
+            message_id=message_id,
+            status=ResponseStatus.ERROR,
+            message=session.status_message or "Session cannot be used due to processing error",
+            metadata=None,
+            request_duration=time.perf_counter() - start_time,
+        )
+    if session.status == SessionStatus.PENDING:
+        logger.info("Session is still processing", session_id=session_id)
+        return ChatResponse(
+            timestamp=datetime.now(timezone.utc),
+            session_id=session_id,
+            message_id=message_id,
+            status=ResponseStatus.ERROR,
+            message=session.status_message
+            or "Session is still being processed. Please wait until processing is complete.",
+            metadata=None,
+            request_duration=time.perf_counter() - start_time,
+        )
+    return None
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_message(request: ChatRequest) -> ChatResponse:
+    """Send a user message to the TelemetryAgent and receive a response.
+
+    Args:
+        request: Chat request with session_id, message, optional message_id, and max_tokens.
+
+    Returns:
+        ChatResponse: Assistant response with metadata and request duration.
 
     Raises:
-        HTTPException: If session_id is invalid or not found.
+        HTTPException: If session_id is invalid or session is not found.
     """
+    start_time: float = time.perf_counter()
+    validate_uuid(request.session_id)
+    logger = logger.bind(session_id=request.session_id)
+
+    # Check session existence
+    session_lock: Optional[asyncio.Lock] = None
+    async with sessions_lock:
+        if request.session_id not in sessions:
+            logger.error("Session not found", session_id=request.session_id)
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=request.message_id or str(uuid.uuid4()),
+                status=ResponseStatus.ERROR,
+                message="Session not found",
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+        session_lock = session_locks[request.session_id]
+
+    # Process message under session lock
+    async with session_lock:
+        session: Session = sessions[request.session_id]
+        if len(session.messages) >= MAX_MESSAGES:
+            logger.error(
+                "Maximum messages reached",
+                session_id=request.session_id,
+                max_messages=MAX_MESSAGES,
+            )
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=request.message_id or str(uuid.uuid4()),
+                status=ResponseStatus.ERROR,
+                message=f"Maximum message limit ({MAX_MESSAGES}) reached",
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+
+        # Handle session status errors
+        error_response: Optional[ChatResponse] = await handle_session_error(
+            session, request.session_id, request.message_id or str(uuid.uuid4()), start_time
+        )
+        if error_response:
+            return error_response
+
+        # Initialize agent
+        db_path: str = os.path.join(
+            STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{request.session_id}.duckdb"
+        )
+        agent: Optional[TelemetryAgent] = await initialize_agent(
+            request.session_id, db_path, start_time
+        )
+        if not agent:
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=request.message_id or str(uuid.uuid4()),
+                status=ResponseStatus.ERROR,
+                message="Failed to initialize chat agent",
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+
+        # Create and save user message
+        message_id: str = request.message_id or str(uuid.uuid4())
+        user_message: Message = Message(
+            message_id=message_id,
+            role="user",
+            content=request.message,
+            timestamp=datetime.now(timezone.utc),
+        )
+        session.messages.append(user_message)
+        logger.debug(
+            "Saved user message to session",
+            session_id=request.session_id,
+            message_id=message_id,
+        )
+
+        # Process message
+        try:
+            response: str
+            metadata: Optional[Dict]
+            response, metadata = await asyncio.wait_for(
+                agent.process_message(request.message, max_tokens=request.max_tokens),
+                timeout=CHAT_TIMEOUT_SECONDS,
+            )
+
+            assistant_message: Message = Message(
+                message_id=message_id,
+                role="assistant",
+                content=response,
+                timestamp=datetime.now(timezone.utc),
+                metadata=metadata,
+            )
+            session.messages.append(assistant_message)
+            logger.info(
+                "Processed chat message",
+                session_id=request.session_id,
+                message_id=message_id,
+                response_length=len(response),
+                max_tokens=request.max_tokens,
+            )
+
+            return ChatResponse(
+                timestamp=assistant_message.timestamp,
+                session_id=request.session_id,
+                message_id=message_id,
+                status=ResponseStatus.SUCCESS,
+                message=response,
+                metadata=metadata,
+                request_duration=time.perf_counter() - start_time,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Chat processing timed out",
+                session_id=request.session_id,
+                timeout=CHAT_TIMEOUT_SECONDS,
+            )
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=message_id,
+                status=ResponseStatus.ERROR,
+                message="Chat processing timed out",
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+        except ValueError as e:
+            logger.error(
+                "Invalid chat request", session_id=request.session_id, error=str(e)
+            )
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=message_id,
+                status=ResponseStatus.ERROR,
+                message=str(e),
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to process chat message",
+                session_id=request.session_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return ChatResponse(
+                timestamp=datetime.now(timezone.utc),
+                session_id=request.session_id,
+                message_id=message_id,
+                status=ResponseStatus.ERROR,
+                message=f"Failed to process chat message: {type(e).__name__}",
+                metadata=None,
+                request_duration=time.perf_counter() - start_time,
+            )
+
+async def stream_json_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
+    """Stream JSON messages to reduce memory usage for large exports.
+
+    Args:
+        messages: List of messages to serialize.
+
+    Yields:
+        bytes: Chunks of JSON-encoded data.
+
+    Raises:
+        ValueError: If JSON serialization fails.
+    """
+    yield b"["
+    for i, message in enumerate(messages):
+        message_dict: Dict = {
+            "timestamp": message.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+            "role": message.role,
+            "message": message.content,
+        }
+        if message.metadata:
+            message_dict["metadata"] = message.metadata
+        try:
+            chunk: str = json.dumps(message_dict, ensure_ascii=False)
+            if i > 0:
+                chunk = f",{chunk}"
+            yield chunk.encode("utf-8")
+            await asyncio.sleep(0)  # Yield control to event loop
+        except TypeError as e:
+            logger.error("JSON serialization failed", message_id=message.message_id, error=str(e))
+            raise ValueError(f"Failed to serialize message to JSON: {str(e)}") from e
+    yield b"]"
+
+@app.get("/export_chat/{session_id}")
+async def export_chat(session_id: str) -> StreamingResponse:
+    """Export chat messages for a session as a downloadable JSON file.
+
+    The JSON file contains a list of objects with:
+    - timestamp: Message timestamp in 'YYYY-MM-DD HH:MM:SS' format.
+    - role: 'user' or 'assistant'.
+    - message: Message content.
+    - metadata: Optional metadata (e.g., relevant_tables, token_usage).
+
+    Args:
+        session_id: Unique session identifier.
+
+    Returns:
+        StreamingResponse: JSON file with Content-Disposition for download.
+
+    Raises:
+        HTTPException: If session_id is invalid, session not found, or no messages exist.
+    """
+    start_time: float = time.perf_counter()
     validate_uuid(session_id)
     logger = logger.bind(session_id=session_id)
-    
+
+    # Check session existence
+    session_lock: Optional[asyncio.Lock] = None
     async with sessions_lock:
         if session_id not in sessions:
-            logger.error("Session not found")
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        del sessions[session_id]
-        logger.info("Deleted session from memory")
-        
-        db_path = os.path.join(STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb")
-        if not os.path.exists(db_path):
-            logger.info("No DuckDB file found to delete")
+            logger.error("Session not found", session_id=session_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            )
+        session_lock = session_locks[session_id]
+
+    # Export messages
+    async with session_lock:
+        session: Session = sessions[session_id]
+        if not session.messages:
+            logger.info("No messages to export", session_id=session_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No messages found for this session",
+            )
+
+        filename: str = generate_filename(session_id, ".json")
+        logger.info(
+            "Exporting chat messages",
+            session_id=session_id,
+            message_count=len(session.messages),
+            filename=filename,
+        )
+
+        try:
+            return StreamingResponse(
+                content=stream_json_messages(session.messages),
+                media_type=JSON_MEDIA_TYPE,
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Cache-Control": "no-cache",
+                },
+            )
+        except ValueError as e:
+            logger.error(
+                "Failed to export chat messages",
+                session_id=session_id,
+                error=str(e),
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to export chat messages: {str(e)}",
+            )
+        finally:
+            logger.info(
+                "Completed export request",
+                session_id=session_id,
+                request_duration=time.perf_counter() - start_time,
+            )
+
+@app.delete("/session/{session_id}", response_model=DeleteSessionResponse)
+async def delete_session(session_id: str) -> DeleteSessionResponse:
+    """Delete a session, its agent, and associated DuckDB file.
+
+    Args:
+        session_id: Unique session identifier.
+
+    Returns:
+        DeleteSessionResponse: Confirmation of deletion with request duration.
+
+    Raises:
+        HTTPException: If session_id is invalid or session not found.
+    """
+    start_time: float = time.perf_counter()
+    validate_uuid(session_id)
+    logger = logger.bind(session_id=session_id)
+
+    # Check session existence
+    session_lock: Optional[asyncio.Lock] = None
+    async with sessions_lock:
+        if session_id not in sessions:
+            logger.error("Session not found", session_id=session_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            )
+        session_lock = session_locks[session_id]
+
+    # Delete session data
+    async with session_lock:
+        db_path: str = os.path.join(
+            STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb"
+        )
+        try:
+            # Remove agent
+            if session_id in agents:
+                del agents[session_id]
+                logger.info("Deleted TelemetryAgent", session_id=session_id)
+
+            # Remove DuckDB file
+            if os.path.exists(db_path):
+                await asyncio.to_thread(os.unlink, db_path)
+                logger.info("Deleted DuckDB file", db_path=db_path)
+
+            # Remove session and lock
+            del sessions[session_id]
+            del session_locks[session_id]
+            logger.info(
+                "Deleted session",
+                session_id=session_id,
+                db_path=db_path,
+            )
+
             return DeleteSessionResponse(
                 timestamp=datetime.now(timezone.utc),
                 session_id=session_id,
-                status=Status.SUCCESS,
-                message=f"Session {session_id} deleted"
+                status=ResponseStatus.SUCCESS,
+                message="Session deleted successfully",
+                request_duration=time.perf_counter() - start_time,
             )
-        try:
-            await asyncio.to_thread(os.remove, db_path)
-            logger.info("Deleted DuckDB file", db_file=db_path)
+
         except OSError as e:
-            logger.warning("Failed to delete DuckDB file", db_file=db_path, error=str(e))
-        
-        return DeleteSessionResponse(
-            timestamp=datetime.now(timezone.utc),
-            session_id=session_id,
-            status=Status.SUCCESS,
-            message=f"Session {session_id} deleted"
-        )
-
-@app.get("/session/{session_id}/export-chat")
-async def export_chat(session_id: str) -> ExportChatResponse:
-    """Export chat history for a session as JSON.
-
-    Args:
-        session_id: Unique UUID of the session.
-
-    Returns:
-        ExportChatResponse: Response with timestamp, session_id, status, and messages.
-
-    Raises:
-        HTTPException: If session_id is invalid or not found.
-    """
-    validate_uuid(session_id)
-    logger = logger.bind(session_id=session_id)
-    
-    async with sessions_lock:
-        if session_id not in sessions:
-            logger.error("Session not found")
-            raise HTTPException(status_code=404, detail="Session not found")
-        
-        messages = sessions[session_id].messages
-        logger.info("Exported chat history", message_count=len(messages))
-        
-        return ExportChatResponse(
-            timestamp=datetime.now(timezone.utc),
-            session_id=session_id,
-            status=Status.SUCCESS,
-            messages=messages
-        )
+            logger.error(
+                "Failed to delete DuckDB file",
+                db_path=db_path,
+                error=str(e),
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to delete session data: {str(e)}",
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to delete session",
+                session_id=session_id,
+                error=str(e),
+                exc_info=True,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to delete session: {str(e)}",
+            )
