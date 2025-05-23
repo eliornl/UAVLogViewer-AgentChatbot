@@ -7,7 +7,6 @@ import pandas as pd
 import structlog
 from pymavlink import mavutil
 from tenacity import async_retry, stop_after_attempt, wait_exponential
-from datetime import datetime, timezone
 from backend.models import Session, SessionStatus
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -15,8 +14,10 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 class TelemetryProcessor:
     """Processes MAVLink telemetry log files and saves data to DuckDB asynchronously.
 
-    Parses binary telemetry logs, extracts relevant messages, and stores
-    them in session-specific DuckDB tables for efficient querying.
+    Parses binary telemetry logs, collects all messages by type, creates one DataFrame
+    per message type, and stores them in session-specific DuckDB tables for efficient querying.
+    Note: The `timestamp` column is included in tables only if `_timestamp` is present in the
+    MAVLink messages; otherwise, it is omitted or may contain NULL values.
     """
 
     # List of telemetry message types to process
@@ -32,12 +33,9 @@ class TelemetryProcessor:
         'EKF_STATUS_REPORT'
     ]
 
-    # Batch size for processing messages to optimize memory usage
-    BATCH_SIZE: int = 1000
-
     # Timeouts for I/O operations
     PARSE_TIMEOUT_SECONDS: float = 300.0  # 5 minutes for large log files
-    BATCH_SAVE_TIMEOUT_SECONDS: float = 60.0  # 1 minute per batch save
+    SAVE_TIMEOUT_SECONDS: float = 120.0  # 2 minutes for saving all tables
 
     @staticmethod
     def map_dtype(dtype: Any) -> str:
@@ -72,9 +70,10 @@ class TelemetryProcessor:
     ) -> None:
         """Parse a telemetry log file asynchronously and save data to DuckDB with retries.
 
-        Creates a session-specific DuckDB file with tables for each telemetry
-        message type. Updates session.status to READY on success or ERROR on
-        failure, with a corresponding status_message.
+        Collects all messages, groups them by telemetry message type, creates one DataFrame
+        per type, and saves them to session-specific DuckDB tables in a single connection.
+        Updates session.status to READY on success or ERROR on failure, with a corresponding
+        status_message.
 
         Args:
             file_path: Path to the telemetry log file (.bin).
@@ -86,7 +85,7 @@ class TelemetryProcessor:
             ValueError: If the file path is invalid or the file is not a valid telemetry file.
             OSError: If file read operations fail.
             duckdb.IOException: If DuckDB database operations fail.
-            asyncio.TimeoutError: If parsing exceeds PARSE_TIMEOUT_SECONDS.
+            asyncio.TimeoutError: If parsing or saving exceeds timeouts.
         """
         logger = logger.bind(session_id=session.session_id, file_name=session.file_name)
         try:
@@ -117,7 +116,7 @@ class TelemetryProcessor:
                 msg_type: [] for msg_type in TelemetryProcessor.TELEMETRY_MESSAGE_TYPES
             }
 
-            # Parse messages from the log file
+            # Parse all messages from the log file
             async def parse_messages() -> None:
                 while True:
                     msg = mav.recv_msg()
@@ -126,56 +125,105 @@ class TelemetryProcessor:
                     msg_type = msg.get_type()
                     if msg_type in TelemetryProcessor.TELEMETRY_MESSAGE_TYPES:
                         msg_dict = msg.to_dict()
-                        # Add timestamp if not present
-                        msg_dict['timestamp'] = getattr(
-                            msg, '_timestamp', datetime.now(timezone.utc).timestamp()
-                        )
                         telemetry_data[msg_type].append(msg_dict)
-
-                        # Save batch if size limit reached
-                        if len(telemetry_data[msg_type]) >= TelemetryProcessor.BATCH_SIZE:
-                            await TelemetryProcessor._save_batch(
-                                telemetry_data[msg_type],
-                                msg_type,
-                                session.session_id,
-                                storage_dir,
-                                db_prefix,
-                                logger
-                            )
-                            telemetry_data[msg_type].clear()
 
             await asyncio.wait_for(
                 asyncio.to_thread(parse_messages),
                 timeout=TelemetryProcessor.PARSE_TIMEOUT_SECONDS
             )
 
-            # Save any remaining messages
-            for msg_type, messages in telemetry_data.items():
-                if messages:
-                    try:
-                        await TelemetryProcessor._save_batch(
-                            messages, msg_type, session.session_id, storage_dir, db_prefix, logger
+            # Create and save DataFrames for each message type
+            async def save_to_duckdb() -> None:
+                # Prepare DuckDB database path
+                os.makedirs(storage_dir, exist_ok=True)
+                db_path = os.path.join(storage_dir, f"{db_prefix}{session.session_id}.duckdb")
+                if ".." in os.path.relpath(db_path, storage_dir):
+                    logger.error("Invalid database path", db_path=db_path)
+                    raise ValueError(f"Invalid database path: {db_path}")
+
+                # Connect to DuckDB
+                with duckdb.connect(db_path) as conn:
+                    for msg_type in TelemetryProcessor.TELEMETRY_MESSAGE_TYPES:
+                        messages = telemetry_data[msg_type]
+                        if not messages:
+                            logger.debug("No messages for type", msg_type=msg_type)
+                            continue
+
+                        # Create DataFrame
+                        try:
+                            df = pd.DataFrame(messages)
+                        except Exception as e:
+                            logger.error(
+                                "Failed to create DataFrame for message type",
+                                msg_type=msg_type,
+                                error=str(e)
+                            )
+                            raise ValueError(f"Failed to create DataFrame for {msg_type}: {str(e)}") from e
+
+                        # Drop 'mavpackettype' column if present
+                        if 'mavpackettype' in df.columns:
+                            df = df.drop(columns=['mavpackettype'])
+
+                        # Generate sanitized table name
+                        table_name = f"telemetry_{re.sub(r'[^a-z0-9_]', '_', msg_type.lower())}"
+
+                        # Define table columns based on DataFrame dtypes
+                        columns = [
+                            f"{col} {TelemetryProcessor.map_dtype(df[col].dtype)}" for col in df.columns
+                        ]
+
+                        # Create table (assumes table does not exist)
+                        logger.debug("Creating table", table_name=table_name, db_path=db_path)
+                        create_table_query = f"""
+                        CREATE TABLE {table_name} (
+                            {', '.join(columns)}
                         )
-                    except (ValueError, duckdb.IOException) as e:
-                        session.status = SessionStatus.ERROR
-                        session.status_message = f"Failed to save batch for {msg_type}: {str(e)}"
-                        logger.error(
-                            "Failed to save batch for message type",
+                        """
+                        try:
+                            conn.execute(create_table_query)
+                        except duckdb.CatalogException as e:
+                            logger.error(
+                                "Failed to create table: table already exists",
+                                table_name=table_name,
+                                db_path=db_path,
+                                error=str(e)
+                            )
+                            raise duckdb.IOException(
+                                f"Failed to create table {table_name}: table already exists in {db_path}"
+                            ) from e
+
+                        # Insert data into table
+                        conn.execute(f"INSERT INTO {table_name} SELECT * FROM df", {'df': df})
+                        logger.info(
+                            "Saved telemetry data",
+                            table_name=table_name,
                             msg_type=msg_type,
-                            error=str(e)
+                            row_count=len(df)
                         )
-                        raise ValueError(f"Failed to save batch for {msg_type}: {str(e)}") from e
+
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(save_to_duckdb),
+                    timeout=TelemetryProcessor.SAVE_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                session.status = SessionStatus.ERROR
+                session.status_message = f"DuckDB save timed out after {TelemetryProcessor.SAVE_TIMEOUT_SECONDS} seconds"
+                logger.error("DuckDB save timed out", timeout=TelemetryProcessor.SAVE_TIMEOUT_SECONDS)
+                raise duckdb.IOException(
+                    f"DuckDB save timed out after {TelemetryProcessor.SAVE_TIMEOUT_SECONDS} seconds"
+                )
 
             # Update session status to READY upon successful completion
             session.status = SessionStatus.READY
             session.status_message = "Ready for chat"
             logger.info("Session status updated to READY")
 
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
             session.status = SessionStatus.ERROR
-            session.status_message = f"Telemetry parsing timed out after {TelemetryProcessor.PARSE_TIMEOUT_SECONDS} seconds"
-            logger.error("Telemetry parsing timed out", timeout=TelemetryProcessor.PARSE_TIMEOUT_SECONDS)
-            raise ValueError(f"Telemetry parsing timed out after {TelemetryProcessor.PARSE_TIMEOUT_SECONDS} seconds")
+            session.status_message = f"Operation timed out: {str(e)}"
+            logger.error("Operation timed out", error=str(e))
+            raise ValueError(f"Operation timed out: {str(e)}") from e
         except (OSError, duckdb.IOException) as e:
             session.status = SessionStatus.ERROR
             session.status_message = f"File or database error: {str(e)}"
@@ -194,119 +242,3 @@ class TelemetryProcessor:
                 exc_info=True
             )
             raise ValueError(f"Unexpected telemetry processing error: {str(e)}") from e
-
-    @staticmethod
-    async def _save_batch(
-        messages: List[Dict[str, Any]],
-        msg_type: str,
-        session_id: str,
-        storage_dir: str,
-        db_prefix: str,
-        logger: structlog.stdlib.BoundLogger
-    ) -> None:
-        """Save a batch of telemetry messages to a DuckDB table asynchronously.
-
-        Args:
-            messages: List of telemetry message dictionaries to save.
-            msg_type: Type of telemetry message (e.g., 'ATTITUDE').
-            session_id: Unique session identifier.
-            storage_dir: Directory for storing DuckDB files.
-            db_prefix: Prefix for DuckDB database filenames.
-            logger: Logger instance for logging operations.
-
-        Raises:
-            ValueError: If the database path is invalid or DataFrame creation fails.
-            duckdb.IOException: If database operations fail.
-            asyncio.TimeoutError: If batch save exceeds BATCH_SAVE_TIMEOUT_SECONDS.
-        """
-        if not messages:
-            logger.debug("No messages to save", msg_type=msg_type)
-            return
-
-        # Convert messages to pandas DataFrame
-        try:
-            df: pd.DataFrame = pd.DataFrame(messages)
-        except Exception as e:
-            logger.error(
-                "Failed to create DataFrame for message type",
-                msg_type=msg_type,
-                error=str(e)
-            )
-            raise ValueError(f"Failed to create DataFrame for {msg_type}: {str(e)}") from e
-
-        # Generate sanitized table name
-        table_name: str = f"telemetry_{re.sub(r'[^a-z0-9_]', '_', msg_type.lower())}"
-
-        # Prepare DuckDB database path
-        os.makedirs(storage_dir, exist_ok=True)
-        db_path: str = os.path.join(storage_dir, f"{db_prefix}{session_id}.duckdb")
-
-        # Validate database path
-        if ".." in os.path.relpath(db_path, storage_dir):
-            logger.error("Invalid database path", db_path=db_path, msg_type=msg_type)
-            raise ValueError(f"Invalid database path for {msg_type} processing: {db_path}")
-
-        # Connect to DuckDB and save data
-        async def save_to_duckdb() -> None:
-            with duckdb.connect(db_path) as conn:
-                # Drop 'mavpackettype' column if present
-                if 'mavpackettype' in df.columns:
-                    df_no_mav = df.drop(columns=['mavpackettype'])
-                else:
-                    df_no_mav = df
-
-                # Define table columns based on DataFrame dtypes
-                columns = [
-                    f"{col} {TelemetryProcessor.map_dtype(df_no_mav[col].dtype)}" for col in df_no_mav.columns
-                ]
-
-                # Create table if it doesn't exist
-                create_table_query = f"""
-                CREATE TABLE IF NOT EXISTS {table_name} (
-                    {', '.join(columns)}
-                )
-                """
-                conn.execute(create_table_query)
-
-                # Insert data into table
-                conn.execute(f"INSERT INTO {table_name} SELECT * FROM df_no_mav", {'df_no_mav': df_no_mav})
-
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(save_to_duckdb),
-                timeout=TelemetryProcessor.BATCH_SAVE_TIMEOUT_SECONDS
-            )
-            logger.info(
-                "Saved telemetry batch",
-                table_name=table_name,
-                msg_type=msg_type,
-                row_count=len(df)
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "DuckDB batch save timed out",
-                table_name=table_name,
-                msg_type=msg_type,
-                timeout=TelemetryProcessor.BATCH_SAVE_TIMEOUT_SECONDS
-            )
-            raise duckdb.IOException(
-                f"DuckDB batch save timed out for {msg_type} after {TelemetryProcessor.BATCH_SAVE_TIMEOUT_SECONDS} seconds"
-            )
-        except duckdb.IOException as e:
-            logger.error(
-                "DuckDB operation failed for message type",
-                table_name=table_name,
-                msg_type=msg_type,
-                error=str(e)
-            )
-            raise duckdb.IOException(f"DuckDB operation failed for {msg_type}: {str(e)}") from e
-        except Exception as e:
-            logger.error(
-                "Unexpected error during batch save for message type",
-                table_name=table_name,
-                msg_type=msg_type,
-                error_type=type(e).__name__,
-                error=str(e),
-                exc_info=True
-            )
-            raise ValueError(f"Unexpected error during batch save for {msg_type}: {str(e)}") from e
