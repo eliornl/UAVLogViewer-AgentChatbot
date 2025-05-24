@@ -19,6 +19,7 @@ class TableMetadata(TypedDict):
     table: str
     columns: List[ColumnMetadata]
     description: str
+    anomaly_hint: str
     example: Dict[str, Any]
 
 # Telemetry schema for FAISS indexing
@@ -35,6 +36,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "yawspeed", "data_type": "float", "unit": "degrees/s", "description": "Yaw angular velocity", "nullable": False}
         ],
         "description": "Vehicle orientation (roll, pitch, yaw) and angular velocities.",
+        "anomaly_hint": "Look for sudden changes in roll, pitch, or yaw; detect outliers in rollspeed, pitchspeed, or yawspeed indicating instability; use ML to identify unusual orientation patterns; correlate with battery or GPS issues.",
         "example": {
             "timestamp": 1678923456,
             "roll": 1.23,
@@ -59,6 +61,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "hdg", "data_type": "int", "unit": "cdeg", "description": "Heading in centidegrees", "nullable": False}
         ],
         "description": "Global position (latitude, longitude, altitude) and velocity.",
+        "anomaly_hint": "Check for sudden changes in altitude or velocity; detect inconsistencies in lat/lon movement; use ML to flag unusual position or velocity patterns; correlate with GPS fix quality.",
         "example": {
             "timestamp": 1678923456,
             "lat": 473976543,
@@ -83,6 +86,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "climb", "data_type": "float", "unit": "m/s", "description": "Climb rate", "nullable": False}
         ],
         "description": "Heads-up display data (airspeed, ground speed, throttle, etc.).",
+        "anomaly_hint": "Look for sudden changes in airspeed, groundspeed, or climb rate; detect inconsistencies between throttle and climb; use ML to identify unusual speed or altitude patterns; correlate with battery status.",
         "example": {
             "timestamp": 1678923456,
             "airspeed": 15.5,
@@ -108,6 +112,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "errors_comm", "data_type": "int", "unit": None, "description": "Communication errors", "nullable": True}
         ],
         "description": "System status including battery and communication metrics.",
+        "anomaly_hint": "Detect sudden drops or unusually low battery voltage or remaining capacity; check for high communication drop rates or errors; use ML to identify unusual sensor health or system load patterns; correlate with attitude or position anomalies.",
         "example": {
             "timestamp": 1678923456,
             "onboard_control_sensors_present": 255,
@@ -129,6 +134,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "text", "data_type": "str", "unit": None, "description": "Status message text", "nullable": True}
         ],
         "description": "Free-form status messages (e.g., warnings, errors).",
+        "anomaly_hint": "Look for high-severity messages indicating warnings or errors; check text for patterns like battery or GPS issues; correlate with other tables to confirm anomalies.",
         "example": {
             "timestamp": 1678923456,
             "severity": 3,
@@ -150,6 +156,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "rssi", "data_type": "int", "unit": None, "description": "Receiver signal strength indicator", "nullable": True}
         ],
         "description": "Remote control channel values and signal strength.",
+        "anomaly_hint": "Check for sudden changes in channel values or low signal strength; use ML to detect unusual channel patterns; correlate with communication errors in sys_status.",
         "example": {
             "timestamp": 1678923456,
             "chan1_raw": 1500,
@@ -178,6 +185,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "satellites_visible", "data_type": "int", "unit": None, "description": "Number of visible satellites", "nullable": False}
         ],
         "description": "Raw GPS data (position, fix type, satellite count).",
+        "anomaly_hint": "Check for poor GPS fix quality or low satellite counts; detect high position uncertainties or inconsistent position/velocity; use ML to flag unusual GPS patterns; correlate with position data.",
         "example": {
             "timestamp": 1678923456,
             "fix_type": 3,
@@ -203,6 +211,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "battery_remaining", "data_type": "int", "unit": "percent", "description": "Remaining battery percentage", "nullable": False}
         ],
         "description": "Detailed battery status (cell voltages, current, energy).",
+        "anomaly_hint": "Detect sudden changes in battery capacity, current, or temperature; check for unusually low cell voltages or capacity; use ML to flag unusual battery patterns; correlate with system status or attitude anomalies.",
         "example": {
             "timestamp": 1678923456,
             "current_consumed": 1200,
@@ -225,6 +234,7 @@ TELEMETRY_SCHEMA: List[TableMetadata] = [
             {"name": "terrain_alt_variance", "data_type": "float", "unit": None, "description": "Terrain altitude variance", "nullable": False}
         ],
         "description": "Extended Kalman Filter status for navigation.",
+        "anomaly_hint": "Check for high variance in velocity, position, or compass; detect unusual EKF flags; use ML to identify abnormal variance patterns; correlate with GPS or position data.",
         "example": {
             "timestamp": 1678923456,
             "flags": 1,
@@ -255,9 +265,14 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
     for meta in metadata:
         # Validate required fields
         table_name: str = meta.get("table", "")
-        if not all(key in meta for key in ["table", "columns", "description", "example"]):
+        if not all(key in meta for key in ["table", "columns", "description", "anomaly_hint", "example"]):
             logger.error("Missing required fields in telemetry schema", table=table_name)
             raise ValueError(f"Missing required fields in telemetry schema for table {table_name}")
+        
+        # Validate anomaly_hint
+        if not isinstance(meta["anomaly_hint"], str) or not meta["anomaly_hint"].strip():
+            logger.error("Invalid or empty anomaly_hint", table=table_name)
+            raise ValueError(f"Invalid or empty anomaly_hint for table {table_name}")
         
         # Validate columns
         if not meta["columns"]:

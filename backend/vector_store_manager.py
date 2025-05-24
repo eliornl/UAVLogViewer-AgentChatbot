@@ -44,7 +44,8 @@ class VectorStoreManager:
     async def initialize(self, timeout_seconds: float = VECTOR_INIT_TIMEOUT_SECONDS) -> None:
         """Initialize the FAISS vector store asynchronously.
 
-        Creates a FAISS vector store from TELEMETRY_SCHEMA embeddings.
+        Creates a FAISS vector store from TELEMETRY_SCHEMA embeddings, including table descriptions,
+        column names, and anomaly hints.
 
         Args:
             timeout_seconds: Timeout for vector store initialization in seconds (default: VECTOR_INIT_TIMEOUT_SECONDS).
@@ -53,8 +54,11 @@ class VectorStoreManager:
             ValueError: If initialization fails due to authentication, network, or other errors.
             asyncio.TimeoutError: If initialization exceeds timeout_seconds.
         """
-        documents: List[str] = [
-            f"{meta['table']}: {meta['description']} Columns: {', '.join(col['name'] for col in meta['columns'])}"
+        documents: List[Document] = [
+            Document(
+                page_content=f"{meta['table']}: {meta['description']} Columns: {', '.join(col['name'] for col in meta['columns'])} Anomaly hint: {meta['anomaly_hint']}",
+                metadata={"table": meta["table"], "anomaly_hint": meta["anomaly_hint"]}
+            )
             for meta in TELEMETRY_SCHEMA
         ]
         if not documents:
@@ -63,7 +67,7 @@ class VectorStoreManager:
 
         try:
             async def init_vector_store() -> FAISS:
-                return FAISS.from_texts(documents, self.embeddings)
+                return FAISS.from_documents(documents, self.embeddings)
 
             self.vector_store = await asyncio.wait_for(
                 asyncio.to_thread(init_vector_store),
@@ -91,15 +95,29 @@ class VectorStoreManager:
             k: Number of results to return (default: 4).
 
         Returns:
-            DocumentList: List of FAISS Document objects matching the query.
+            DocumentList: List of Document objects with table and anomaly_hint metadata.
 
         Raises:
             ValueError: If search fails due to network or other errors.
             asyncio.TimeoutError: If search exceeds VECTOR_SEARCH_TIMEOUT_SECONDS.
         """
+        if self.vector_store is None:
+            self.logger.error("Vector store not initialized")
+            raise ValueError("Vector store not initialized")
+
         try:
             async def run_search() -> DocumentList:
-                return self.vector_store.similarity_search(query, k=k)
+                results = self.vector_store.similarity_search(query, k=k)
+                return [
+                    Document(
+                        page_content=result.page_content,
+                        metadata={
+                            "table": result.metadata.get("table", ""),
+                            "anomaly_hint": result.metadata.get("anomaly_hint", "")
+                        }
+                    )
+                    for result in results
+                ]
 
             results = await asyncio.wait_for(
                 asyncio.to_thread(run_search),
