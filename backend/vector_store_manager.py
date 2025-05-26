@@ -66,7 +66,7 @@ class VectorStoreManager:
             raise ValueError("TELEMETRY_SCHEMA is empty; cannot initialize vector store")
 
         try:
-            async def init_vector_store() -> FAISS:
+            def init_vector_store() -> FAISS:
                 return FAISS.from_documents(documents, self.embeddings)
 
             self.vector_store = await asyncio.wait_for(
@@ -106,7 +106,7 @@ class VectorStoreManager:
             raise ValueError("Vector store not initialized")
 
         try:
-            async def run_search() -> DocumentList:
+            def run_search() -> DocumentList:
                 results = self.vector_store.similarity_search(query, k=k)
                 return [
                     Document(

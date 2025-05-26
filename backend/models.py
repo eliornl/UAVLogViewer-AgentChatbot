@@ -1,4 +1,4 @@
-from enum import StrEnum
+from enum import Enum
 from datetime import datetime
 import re
 from typing import List, Dict, Optional, Any, Literal, TypeAlias
@@ -20,12 +20,12 @@ ID_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_]+$")  # Alphanumeric, hyphe
 FILE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_\.]+$")  # Alphanumeric, hyphens, underscores, dots
 ROLE_TYPES: tuple[str, ...] = ("user", "assistant")
 
-class ResponseStatus(StrEnum):
+class ResponseStatus(str, Enum):
     """Status codes for API responses."""
     SUCCESS = "SUCCESS"
     ERROR = "ERROR"
 
-class SessionStatus(StrEnum):
+class SessionStatus(str, Enum):
     """Status codes for session processing state."""
     PENDING = "PENDING"
     READY = "READY"

@@ -1,5 +1,6 @@
-from typing import Dict, Any, Optional, List, Tuple, Union
+from typing import Dict, Any, Optional, List, Tuple
 import os
+from pydantic import BaseModel, Field, model_validator
 import structlog
 import asyncio
 import pandas as pd
@@ -7,12 +8,14 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.tools import Tool
-from langchain.agents import create_openai_tools_agent, AgentExecutor
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_core.tools import Tool, StructuredTool
+from langchain.agents import create_openai_tools_agent, AgentExecutor, create_react_agent
 from langchain.callbacks.base import BaseCallbackHandler
-from langchain_core.runnables import RunnableMap
+from langchain_core.runnables import RunnableLambda
 import duckdb
+import json
+from backend.agent_scratchpad import AgentScratchpad
 from backend.conversation_memory_manager import ConversationMemoryManager
 from backend.vector_store_manager import VectorStoreManager
 from backend.telemetry_schema import TELEMETRY_SCHEMA
@@ -31,17 +34,45 @@ LLM_TEMPERATURE: float = 0.0  # LLM temperature for deterministic responses
 VECTOR_RETRIEVER_K: int = 4  # Number of vector store search results
 QUERY_TIMEOUT_SECONDS: float = 30.0  # Timeout for DuckDB queries
 CHAT_TIMEOUT_SECONDS: float = 60.0  # Timeout for agent processing, including ML
-SYSTEM_PROMPT: str = """You are a telemetry data analysis assistant specialized in detecting flight anomalies in MAVLink data. Use the provided tools to query telemetry data from DuckDB tables and analyze it for anomalies.
-Tables available: {tables}.
+
+REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized in detecting flight anomalies in MAVLink data. 
+
+Tables available (including column names in parentheses): {tables}
+
+You have access to the following tools:
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action (must be valid JSON)
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+IMPORTANT: When using tools, the Action Input must be valid JSON format. Examples:
+
+For query_duckdb:
+Action Input: {{"db_path": "/path/to/database.duckdb", "query": "SELECT AVG(altitude) FROM table_name"}}
+
+For analyze_stats:
+Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"], "metrics": ["mean", "std"]}}
+
+For detect_anomalies_ml:
+Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"]}}
 
 For each question:
-1. Identify relevant table(s) using the vector store, which includes anomaly detection hints (e.g., "check sudden altitude changes").
-2. Generate a precise SQL query using the query_duckdb tool to fetch relevant data.
-3. Use the analyze_stats tool to compute statistical metrics (e.g., Z-scores, differences) for anomaly detection.
-4. Use the detect_anomalies_ml tool for unsupervised anomaly detection on numerical columns.
-5. Reason about patterns, thresholds, and inconsistencies dynamically, avoiding hardcoded rules.
-6. For high-level questions (e.g., "Are there any anomalies in this flight?"), query multiple tables, analyze key columns (e.g., roll, altitude, battery voltage), and summarize findings.
-7. Format the response clearly, explaining detected anomalies and their potential impact.
+1. Consult the 'Tables available' list to identify relevant table(s) AND THEIR EXACT COLUMN NAMES. The format is table_name(column1, column2, ...).
+2. CRITICAL: Use ONLY the column names explicitly listed for a table in your SQL queries. DO NOT assume common names like 'timestamp' if not listed for that specific table. Verify against the list before every query.
+3. Generate a precise SQL query using the query_duckdb tool to fetch relevant data.
+4. Use the analyze_stats tool to compute statistical metrics (e.g., Z-scores, differences) for anomaly detection.
+5. Use the detect_anomalies_ml tool for unsupervised anomaly detection on numerical columns.
+6. Reason about patterns, thresholds, and inconsistencies dynamically, avoiding hardcoded rules.
+7. For high-level questions (e.g., "Are there any anomalies in this flight?"), query multiple tables, analyze key columns (e.g., roll, altitude, battery voltage), and summarize findings.
+8. Format the response clearly, explaining detected anomalies and their potential impact.
 
 Anomaly detection strategies:
 - Look for sudden changes in values (e.g., altitude drops, battery voltage decreases).
@@ -50,7 +81,16 @@ Anomaly detection strategies:
 - Correlate anomalies across tables (e.g., battery issues coinciding with attitude changes).
 
 If the question is ambiguous, ask for clarification and suggest possible interpretations.
-If data is missing, inform the user and suggest alternatives."""
+If data is missing, inform the user and suggest alternatives.
+
+Scratchpad (previous analysis context):
+{agent_scratchpad_content}
+
+Begin!
+
+Question: {input}
+Thought: {agent_scratchpad}"""
+
 CLARIFICATION_PHRASES: List[str] = [
     "could you clarify",
     "can you clarify",
@@ -91,12 +131,53 @@ if MAX_TOKEN_SAFETY_LIMIT <= MAX_MODEL_TOKENS:
         f"MAX_MODEL_TOKENS ({MAX_MODEL_TOKENS})"
     )
 
-async def query_duckdb(db_path: str, query: str) -> Dict[str, Any]:
-    """Execute a SQL query asynchronously on a DuckDB database.
+# Pydantic models for the tools' input arguments
+class QueryDuckDBInput(BaseModel):
+    db_path: str = Field(description="Path to the DuckDB database file")
+    query: str = Field(description="SQL query to execute")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _handle_potentially_nested_json_input(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Check if 'query' is missing and 'db_path' holds a string,
+            # which matches the observed error pattern.
+            if 'query' not in data and 'db_path' in data and isinstance(data['db_path'], str):
+                db_path_value = data['db_path']
+                try:
+                    # Attempt to parse the string in 'db_path' as JSON
+                    parsed_json_from_db_path = json.loads(db_path_value)
+                    # Check if the parsed JSON is a dict and contains both 'db_path' and 'query'
+                    if isinstance(parsed_json_from_db_path, dict) and \
+                       'db_path' in parsed_json_from_db_path and \
+                       'query' in parsed_json_from_db_path:
+                        logger.info(
+                            f"{cls.__name__}: Input data appeared to have JSON string in 'db_path'. Expanding.",
+                            original_data_keys=list(data.keys()),
+                            parsed_json_keys=list(parsed_json_from_db_path.keys())
+                        )
+                        # Return the parsed JSON dictionary for Pydantic to use
+                        return parsed_json_from_db_path
+                except json.JSONDecodeError:
+                    # 'db_path' value was a string but not valid JSON, or not the structure we expected.
+                    # Log this, but let Pydantic handle the original 'data'.
+                    # This will likely lead to the original validation error if 'query' is truly missing.
+                    logger.warning(
+                        f"{cls.__name__}: 'db_path' contained a string that was not parsable " +
+                        "into the expected {{'db_path': ..., 'query': ...}} structure.",
+                        db_path_value_snippet=db_path_value[:100] # Log a snippet for diagnosis
+                    )
+                    # Fall through to return original data, allowing standard Pydantic validation to proceed
+                    pass
+        # If not the specific scenario identified, or if correction failed, return data as is.
+        return data
+
+def query_duckdb(tool_input: Any) -> Dict[str, Any]:
+    """Execute a SQL query on a DuckDB database.
 
     Args:
-        db_path (str): Path to the DuckDB database file.
-        query (str): SQL query to execute.
+        tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
+                          containing db_path and query.
 
     Returns:
         Dict[str, Any]: Query results or error details.
@@ -104,11 +185,44 @@ async def query_duckdb(db_path: str, query: str) -> Dict[str, Any]:
             - data: List of dictionaries mapping column names to row values (if success).
             - row_count: Number of rows returned (if success).
             - message: Error message (if error).
-
-    Raises:
-        asyncio.TimeoutError: If query execution exceeds QUERY_TIMEOUT_SECONDS.
-        ValueError: If db_path or query is invalid.
     """
+    logger.info(
+        "query_duckdb received raw tool_input", 
+        input_type=str(type(tool_input)), 
+        input_value_snippet=str(tool_input)[:200]
+    )
+
+    args_dict: Optional[Dict[str, Any]] = None
+    if isinstance(tool_input, str):
+        try:
+            args_dict = json.loads(tool_input)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to decode tool_input string as JSON", error_str=str(e), tool_input_str=tool_input)
+            return {"status": "error", "message": f"Invalid JSON input string: {str(e)}"}
+    elif isinstance(tool_input, dict):
+        args_dict = tool_input
+    else:
+        logger.error("tool_input is not a string or dict", received_type=str(type(tool_input)))
+        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
+
+    if args_dict is None: # Should not happen if logic above is correct, but as a safeguard
+        logger.error("args_dict is None after input processing, which is unexpected.")
+        return {"status": "error", "message": "Internal error: Failed to process tool input."}
+
+    try:
+        # Validate the dictionary using Pydantic. 
+        # The model_validator in QueryDuckDBInput will handle nested JSON if necessary.
+        parsed_args = QueryDuckDBInput.model_validate(args_dict)
+        db_path = parsed_args.db_path
+        query = parsed_args.query
+    except Exception as pydantic_exc: # Catch Pydantic ValidationError or other issues
+        logger.error(
+            "Pydantic validation failed for derived args_dict", 
+            args_dict_val=str(args_dict)[:500], # Log potentially large dict snippet
+            error_str=str(pydantic_exc)
+        )
+        return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
+
     try:
         # Prevent path traversal attacks
         if ".." in os.path.relpath(db_path):
@@ -116,53 +230,47 @@ async def query_duckdb(db_path: str, query: str) -> Dict[str, Any]:
             return {"status": "error", "message": "Invalid database path"}
 
         # Block dangerous SQL operations
-        query_lower: str = query.lower()
-        if any(keyword in query_lower for keyword in ["drop", "delete", "update", "insert"]):
+        query_lower: str = query.lower().strip()
+        dangerous_keywords = ["drop", "delete", "update", "insert", "alter", "create", "truncate"]
+        if any(keyword in query_lower for keyword in dangerous_keywords):
             logger.error("Potentially dangerous query detected", query=query)
             return {"status": "error", "message": "Query contains unsupported operations"}
-
-        async def run_query() -> Dict[str, Any]:
-            # Use read-only connection to ensure data safety
-            with duckdb.connect(db_path, read_only=True) as conn:
-                result: List[Tuple] = conn.execute(query).fetchall()
-                columns: List[str] = [desc[0] for desc in conn.description]
-                return {
-                    "status": "success",
-                    "data": [dict(zip(columns, row)) for row in result],
-                    "row_count": len(result)
-                }
-
-        # Run query in a thread to avoid blocking the event loop
-        return await asyncio.wait_for(
-            asyncio.to_thread(run_query),
-            timeout=QUERY_TIMEOUT_SECONDS
+        
+        with duckdb.connect(db_path, read_only=True) as conn:
+            result: List[tuple] = conn.execute(query).fetchall()
+            columns: List[str] = [desc[0] for desc in conn.description] if conn.description else []
+            
+            return {
+                "status": "success",
+                "data": [dict(zip(columns, row)) for row in result],
+                "row_count": len(result)
+            }
+    except KeyError as e: # Should ideally be caught by Pydantic validation now
+        logger.error(
+            "query_duckdb missing expected keys after Pydantic validation (should not happen)", 
+            parsed_args_dict=parsed_args.model_dump() if parsed_args else "parsed_args_is_None",
+            missing_key=str(e)
         )
-
-    except asyncio.TimeoutError:
-        logger.error("DuckDB query timed out", query=query, timeout=QUERY_TIMEOUT_SECONDS)
-        return {"status": "error", "message": f"Query timed out after {QUERY_TIMEOUT_SECONDS} seconds"}
+        return {"status": "error", "message": f"Internal error: Missing expected argument {str(e)} after validation"}
     except duckdb.Error as e:
-        logger.error("DuckDB query execution failed", query=query, error=str(e))
+        logger.error("DuckDB query execution failed", query=query, error_str=str(e))
         return {"status": "error", "message": f"Query failed: {str(e)}"}
     except Exception as e:
-        logger.error("Unexpected error during DuckDB query", query=query, error=str(e))
+        logger.error("Unexpected error during DuckDB query execution", query=query, error_str=str(e), error_type=str(type(e)))
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
-# Register query_duckdb as a LangChain tool
-query_duckdb_tool: Tool = Tool.from_function(
-    func=query_duckdb,
-    name="query_duckdb",
-    description="Execute a SQL query on a DuckDB database and return the results."
-)
+class AnalyzeStatsInput(BaseModel):
+    db_path: str = Field(description="Path to the DuckDB database file")
+    table: str = Field(description="Name of the telemetry table")
+    columns: List[str] = Field(description="Columns to analyze")
+    metrics: List[str] = Field(description="Metrics to compute: 'z_score', 'difference', 'mean', 'std'")
 
-async def analyze_stats(db_path: str, table: str, columns: List[str], metrics: List[str]) -> Dict[str, Any]:
+def analyze_stats(tool_input: Any) -> Dict[str, Any]:
     """Compute statistical metrics for anomaly detection on telemetry data.
 
     Args:
-        db_path (str): Path to the DuckDB database file.
-        table (str): Name of the telemetry table (e.g., 'telemetry_attitude').
-        columns (List[str]): Columns to analyze (e.g., ['roll', 'pitch']).
-        metrics (List[str]): Metrics to compute ('z_score', 'difference', 'mean', 'std').
+        tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
+                          containing db_path, table, columns, and metrics.
 
     Returns:
         Dict[str, Any]: Statistical results or error details.
@@ -170,144 +278,308 @@ async def analyze_stats(db_path: str, table: str, columns: List[str], metrics: L
             - data: List of dictionaries with metric results per column.
             - row_count: Number of rows analyzed (if success).
             - message: Error message (if error).
-
-    Raises:
-        asyncio.TimeoutError: If analysis exceeds QUERY_TIMEOUT_SECONDS.
-        ValueError: If db_path, table, or columns are invalid.
     """
+    logger.info(
+        "analyze_stats received raw tool_input", 
+        input_type=str(type(tool_input)), 
+        input_value_snippet=str(tool_input)[:200]
+    )
+
+    args_dict: Optional[Dict[str, Any]] = None
+    if isinstance(tool_input, str):
+        try:
+            args_dict = json.loads(tool_input)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to decode tool_input string as JSON", error_str=str(e), tool_input_str=tool_input)
+            return {"status": "error", "message": f"Invalid JSON input string: {str(e)}"}
+    elif isinstance(tool_input, dict):
+        args_dict = tool_input
+    else:
+        logger.error("tool_input is not a string or dict", received_type=str(type(tool_input)))
+        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
+
+    if args_dict is None: # Should not happen if logic above is correct, but as a safeguard
+        logger.error("args_dict is None after input processing, which is unexpected.")
+        return {"status": "error", "message": "Internal error: Failed to process tool input."}
+
+    try:
+        # Validate the dictionary using Pydantic. 
+        # The model_validator in AnalyzeStatsInput will handle nested JSON if necessary.
+        parsed_args = AnalyzeStatsInput.model_validate(args_dict)
+        db_path = parsed_args.db_path
+        table = parsed_args.table
+        columns = parsed_args.columns
+        metrics = parsed_args.metrics
+    except Exception as pydantic_exc: # Catch Pydantic ValidationError or other issues
+        logger.error(
+            "Pydantic validation failed for derived args_dict", 
+            args_dict_val=str(args_dict)[:500], # Log potentially large dict snippet
+            error_str=str(pydantic_exc)
+        )
+        return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
+
     try:
         # Prevent path traversal attacks
         if ".." in os.path.relpath(db_path):
             logger.error("Invalid database path detected", db_path=db_path)
             return {"status": "error", "message": "Invalid database path"}
 
-        async def compute_stats() -> Dict[str, Any]:
-            with duckdb.connect(db_path, read_only=True) as conn:
-                # Validate table and columns
+        with duckdb.connect(db_path, read_only=True) as conn:
+            # Validate table exists
+            try:
+                conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            except duckdb.Error:
+                return {"status": "error", "message": f"Table '{table}' does not exist"}
+            
+            # Validate table and columns
+            try:
                 available_columns: List[str] = [col[0] for col in conn.execute(f"DESCRIBE {table}").fetchall()]
-                valid_columns: List[str] = [col for col in columns if col in available_columns]
-                if not valid_columns:
-                    return {"status": "error", "message": f"No valid columns in {table}: {columns}"}
+            except duckdb.Error as e:
+                return {"status": "error", "message": f"Failed to describe table '{table}': {str(e)}"}
+            
+            valid_columns: List[str] = [col for col in columns if col in available_columns]
+            if not valid_columns:
+                return {"status": "error", "message": f"No valid columns in {table}. Available: {available_columns}, Requested: {columns}"}
 
-                # Fetch data, including timestamp if available
-                query_columns: List[str] = valid_columns + ['timestamp'] if 'timestamp' in available_columns else valid_columns
-                query: str = f"SELECT {', '.join(query_columns)} FROM {table}"
-                df: pd.DataFrame = conn.execute(query).fetchdf()
+            # Fetch data, including timestamp if available
+            query_columns: List[str] = valid_columns.copy()
+            if 'timestamp' in available_columns and 'timestamp' not in query_columns:
+                query_columns.append('timestamp')
+            
+            query: str = f"SELECT {', '.join(query_columns)} FROM {table}"
+            df: pd.DataFrame = conn.execute(query).fetchdf()
+            
+            if df.empty:
+                return {"status": "success", "data": [], "row_count": 0}
 
-                # Compute metrics for each column
-                results: List[Dict[str, Any]] = []
-                for col in valid_columns:
-                    result: Dict[str, Any] = {"column": col}
+            # Compute metrics for each column
+            results: List[Dict[str, Any]] = []
+            for col in valid_columns:
+                result: Dict[str, Any] = {"column": col}
+                
+                # Check if column is numeric
+                is_numeric = pd.api.types.is_numeric_dtype(df[col])
+                result["is_numeric"] = is_numeric
+                
+                if is_numeric:
+                    col_data = df[col].dropna()  # Remove NaN values
+                    if len(col_data) == 0:
+                        result["error"] = "No valid numeric data"
+                        results.append(result)
+                        continue
+                    
                     if 'mean' in metrics:
-                        result["mean"] = float(df[col].mean()) if pd.api.types.is_numeric_dtype(df[col]) else None
+                        result["mean"] = float(col_data.mean())
                     if 'std' in metrics:
-                        result["std"] = float(df[col].std()) if pd.api.types.is_numeric_dtype(df[col]) else None
-                    if 'z_score' in metrics and pd.api.types.is_numeric_dtype(df[col]):
-                        mean: float = df[col].mean()
-                        std: float = df[col].std()
-                        if std > 0:
-                            result["z_scores"] = [float(z) for z in (df[col] - mean) / std]
-                    if 'difference' in metrics and pd.api.types.is_numeric_dtype(df[col]):
-                        result["differences"] = [float(d) for d in df[col].diff().abs()]
-                    results.append(result)
+                        result["std"] = float(col_data.std())
+                    if 'min' in metrics:
+                        result["min"] = float(col_data.min())
+                    if 'max' in metrics:
+                        result["max"] = float(col_data.max())
+                    
+                    if 'z_score' in metrics:
+                        mean_val: float = col_data.mean()
+                        std_val: float = col_data.std()
+                        if std_val > 0:
+                            z_scores = (col_data - mean_val) / std_val
+                            result["z_scores"] = z_scores.tolist()
+                            result["z_score_outliers"] = (abs(z_scores) > 3).sum()  # Count outliers
+                        else:
+                            result["z_scores"] = []
+                            result["z_score_outliers"] = 0
+                    
+                    if 'difference' in metrics:
+                        differences = col_data.diff().abs().dropna()
+                        result["differences"] = differences.tolist()
+                        result["max_difference"] = float(differences.max()) if len(differences) > 0 else 0
+                else:
+                    result["error"] = "Column is not numeric"
+                
+                results.append(result)
 
-                return {"status": "success", "data": results, "row_count": len(df)}
+            return {"status": "success", "data": results, "row_count": len(df)}
 
-        return await asyncio.wait_for(
-            asyncio.to_thread(compute_stats),
-            timeout=QUERY_TIMEOUT_SECONDS
-        )
-
-    except asyncio.TimeoutError:
-        logger.error("Statistical analysis timed out", table=table, timeout=QUERY_TIMEOUT_SECONDS)
-        return {"status": "error", "message": f"Analysis timed out after {QUERY_TIMEOUT_SECONDS} seconds"}
     except Exception as e:
         logger.error("Statistical analysis failed", table=table, error=str(e))
         return {"status": "error", "message": f"Analysis failed: {str(e)}"}
 
-# Register analyze_stats as a LangChain tool
-analyze_stats_tool: Tool = Tool.from_function(
-    func=analyze_stats,
-    name="analyze_stats",
-    description="Compute statistical metrics (e.g., Z-scores, differences) on telemetry data for anomaly detection."
-)
+class DetectAnomaliesMLInput(BaseModel):
+    db_path: str = Field(description="Path to the DuckDB database file")
+    table: str = Field(description="Name of the telemetry table")
+    columns: List[str] = Field(description="Numerical columns to analyze")
 
-async def detect_anomalies_ml(db_path: str, table: str, columns: List[str]) -> Dict[str, Any]:
+def detect_anomalies_ml(tool_input: Any) -> Dict[str, Any]:
     """Detect anomalies in telemetry data using Isolation Forest.
 
     Args:
-        db_path (str): Path to the DuckDB database file.
-        table (str): Name of the telemetry table.
-        columns (List[str]): Numerical columns to analyze.
+        tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
+                          containing db_path, table, and columns.
 
     Returns:
         Dict[str, Any]: Anomaly detection results or error details.
             - status: 'success' or 'error'.
             - data: List of dictionaries with row indices and anomaly flags (True for anomalies).
+            - anomaly_count: Number of anomalies detected.
             - row_count: Number of rows analyzed (if success).
             - message: Error message (if error).
-
-    Raises:
-        asyncio.TimeoutError: If detection exceeds QUERY_TIMEOUT_SECONDS.
-        ValueError: If db_path, table, or columns are invalid.
     """
+    logger.info(
+        "detect_anomalies_ml received raw tool_input", 
+        input_type=str(type(tool_input)), 
+        input_value_snippet=str(tool_input)[:200]
+    )
+
+    args_dict: Optional[Dict[str, Any]] = None
+    if isinstance(tool_input, str):
+        try:
+            args_dict = json.loads(tool_input)
+        except json.JSONDecodeError as e:
+            logger.error("Failed to decode tool_input string as JSON", error_str=str(e), tool_input_str=tool_input)
+            return {"status": "error", "message": f"Invalid JSON input string: {str(e)}"}
+    elif isinstance(tool_input, dict):
+        args_dict = tool_input
+    else:
+        logger.error("tool_input is not a string or dict", received_type=str(type(tool_input)))
+        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
+
+    if args_dict is None: # Should not happen if logic above is correct, but as a safeguard
+        logger.error("args_dict is None after input processing, which is unexpected.")
+        return {"status": "error", "message": "Internal error: Failed to process tool input."}
+
+    try:
+        # Validate the dictionary using Pydantic. 
+        # The model_validator in DetectAnomaliesMLInput will handle nested JSON if necessary.
+        parsed_args = DetectAnomaliesMLInput.model_validate(args_dict)
+        db_path = parsed_args.db_path
+        table = parsed_args.table
+        columns = parsed_args.columns
+    except Exception as pydantic_exc: # Catch Pydantic ValidationError or other issues
+        logger.error(
+            "Pydantic validation failed for derived args_dict", 
+            args_dict_val=str(args_dict)[:500], # Log potentially large dict snippet
+            error_str=str(pydantic_exc)
+        )
+        return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
+
     try:
         # Prevent path traversal attacks
         if ".." in os.path.relpath(db_path):
             logger.error("Invalid database path detected", db_path=db_path)
             return {"status": "error", "message": "Invalid database path"}
 
-        async def run_ml() -> Dict[str, Any]:
-            with duckdb.connect(db_path, read_only=True) as conn:
-                # Validate numerical columns
+        with duckdb.connect(db_path, read_only=True) as conn:
+            # Validate table exists
+            try:
+                conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
+            except duckdb.Error:
+                return {"status": "error", "message": f"Table '{table}' does not exist"}
+            
+            # Get available columns
+            try:
                 available_columns: List[str] = [col[0] for col in conn.execute(f"DESCRIBE {table}").fetchall()]
-                valid_columns: List[str] = [
-                    col for col in columns
-                    if col in available_columns and pd.api.types.is_numeric_dtype(
-                        conn.execute(f"SELECT {col} FROM {table} LIMIT 1").fetchdf()[col]
-                    )
-                ]
-                if not valid_columns:
-                    return {"status": "error", "message": f"No valid numerical columns in {table}: {columns}"}
+            except duckdb.Error as e:
+                return {"status": "error", "message": f"Failed to describe table '{table}': {str(e)}"}
+            
+            # Filter for valid columns that exist in the table
+            valid_columns: List[str] = [col for col in columns if col in available_columns]
+            if not valid_columns:
+                return {"status": "error", "message": f"No valid columns in {table}. Available: {available_columns}, Requested: {columns}"}
 
-                # Fetch data
-                query: str = f"SELECT {', '.join(valid_columns)} FROM {table}"
-                df: pd.DataFrame = conn.execute(query).fetchdf()
-                if df.empty:
-                    return {"status": "success", "data": [], "row_count": 0}
+            # Fetch data
+            query: str = f"SELECT {', '.join(valid_columns)} FROM {table}"
+            df: pd.DataFrame = conn.execute(query).fetchdf()
+            
+            if df.empty:
+                return {"status": "success", "data": [], "anomaly_count": 0, "row_count": 0}
 
-                # Fit Isolation Forest model
-                model: IsolationForest = IsolationForest(contamination=0.1, random_state=42)
-                predictions: np.ndarray = model.fit_predict(df[valid_columns])
-                anomalies: np.ndarray = predictions == -1  # -1 indicates anomaly
+            # Filter for numerical columns only
+            numerical_columns = []
+            for col in valid_columns:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    numerical_columns.append(col)
+            
+            if not numerical_columns:
+                return {"status": "error", "message": f"No numerical columns found. Available columns: {valid_columns}"}
 
-                # Format results
-                results: List[Dict[str, Any]] = [
-                    {"row_index": i, "is_anomaly": bool(a)} for i, a in enumerate(anomalies)
-                ]
-                return {
-                    "status": "success",
-                    "data": results,
-                    "row_count": len(df)
+            # Remove rows with NaN values in the selected columns
+            df_clean = df[numerical_columns].dropna()
+            if df_clean.empty:
+                return {"status": "error", "message": "No valid data after removing NaN values"}
+
+            # Fit Isolation Forest model
+            model: IsolationForest = IsolationForest(
+                contamination=0.1,  # Expect 10% anomalies
+                random_state=42,
+                n_estimators=100
+            )
+            predictions: np.ndarray = model.fit_predict(df_clean)
+            anomaly_scores: np.ndarray = model.decision_function(df_clean)
+            
+            # -1 indicates anomaly, 1 indicates normal
+            anomalies: np.ndarray = predictions == -1
+            
+            # Format results - map back to original dataframe indices
+            results: List[Dict[str, Any]] = []
+            anomaly_count = 0
+            
+            for i, (idx, is_anomaly) in enumerate(zip(df_clean.index, anomalies)):
+                result = {
+                    "row_index": int(idx),  # Original dataframe index
+                    "is_anomaly": bool(is_anomaly),
+                    "anomaly_score": float(anomaly_scores[i])
                 }
+                results.append(result)
+                if is_anomaly:
+                    anomaly_count += 1
 
-        return await asyncio.wait_for(
-            asyncio.to_thread(run_ml),
-            timeout=QUERY_TIMEOUT_SECONDS
-        )
+            return {
+                "status": "success",
+                "data": results,
+                "anomaly_count": anomaly_count,
+                "row_count": len(df_clean),
+                "columns_used": numerical_columns
+            }
 
-    except asyncio.TimeoutError:
-        logger.error("ML anomaly detection timed out", table=table, timeout=QUERY_TIMEOUT_SECONDS)
-        return {"status": "error", "message": f"Detection timed out after {QUERY_TIMEOUT_SECONDS} seconds"}
     except Exception as e:
         logger.error("ML anomaly detection failed", table=table, error=str(e))
         return {"status": "error", "message": f"Detection failed: {str(e)}"}
 
-# Register detect_anomalies_ml as a LangChain tool
-detect_anomalies_ml_tool: Tool = Tool.from_function(
+# Register tools for LangChain - all functions are now synchronous
+query_duckdb_tool: StructuredTool = StructuredTool.from_function(
+    func=query_duckdb,
+    name="query_duckdb",
+    description=(
+        "Execute a SQL query on a DuckDB database. Use this to fetch telemetry data. "
+        "Parameters: db_path (string, path to database), query (string, SQL query). "
+        "Example: query_duckdb(db_path='/path/to/db.duckdb', query='SELECT AVG(altitude) FROM telemetry_global_position'). "
+        "Returns query results with status, data, and row_count."
+    ),
+    args_schema=QueryDuckDBInput
+)
+
+analyze_stats_tool: StructuredTool = StructuredTool.from_function(
+    func=analyze_stats,
+    name="analyze_stats",
+    description=(
+        "Compute statistical metrics on telemetry data for anomaly detection. "
+        "Parameters: db_path (string), table (string), columns (list of strings), metrics (list of strings). "
+        "Available metrics: 'mean', 'std', 'min', 'max', 'z_score', 'difference'. "
+        "Example: analyze_stats(db_path='/path/to/db.duckdb', table='telemetry_attitude', columns=['roll', 'pitch'], metrics=['mean', 'std', 'z_score']). "
+        "Use z_score to find outliers (>3 indicates anomaly), difference to find sudden changes."
+    ),
+    args_schema=AnalyzeStatsInput
+)
+
+detect_anomalies_ml_tool: StructuredTool = StructuredTool.from_function(
     func=detect_anomalies_ml,
     name="detect_anomalies_ml",
-    description="Detect anomalies in telemetry data using an unsupervised machine learning model (Isolation Forest)."
+    description=(
+        "Detect anomalies in telemetry data using machine learning (Isolation Forest). "
+        "Parameters: db_path (string), table (string), columns (list of numerical column names). "
+        "Example: detect_anomalies_ml(db_path='/path/to/db.duckdb', table='telemetry_attitude', columns=['roll', 'pitch', 'yaw']). "
+        "Returns anomaly flags and scores for each row. Use this for unsupervised anomaly detection."
+    ),
+    args_schema=DetectAnomaliesMLInput
 )
 
 class TokenUsageCallback(BaseCallbackHandler):
@@ -379,10 +651,11 @@ class TelemetryAgent:
         self.max_context_tokens: Optional[int] = None
         self.fallback_token_limit: Optional[int] = None
         self.llm: Optional[ChatOpenAI] = None
-        self.prompt: Optional[ChatPromptTemplate] = None
+        self.prompt: Optional[PromptTemplate] = None
         self.conversation_memory_manager: Optional[ConversationMemoryManager] = None
         self.token_callback: Optional[TokenUsageCallback] = None
-        self.agent_chain: Optional[RunnableMap] = None
+        self.agent_executor: Optional[AgentExecutor] = None
+        self.scratchpad: AgentScratchpad = AgentScratchpad(session_id=session_id)
         self.logger: structlog.stdlib.BoundLogger = logger.bind(session_id=session_id)
 
     async def async_initialize(self) -> None:
@@ -412,12 +685,19 @@ class TelemetryAgent:
             callbacks=[self.token_callback]
         )
 
-        # Define prompt with system instructions and chat history
-        self.prompt = ChatPromptTemplate.from_messages([
-            ("system", SYSTEM_PROMPT),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}")
-        ])
+        # Get tables info for the prompt
+        tables_info = await self.get_tables_as_string()
+
+        # Define ReAct prompt template
+        self.prompt = PromptTemplate(
+            template=REACT_SYSTEM_PROMPT,
+            input_variables=["input", "agent_scratchpad", "agent_scratchpad_content"],
+            partial_variables={
+                "tables": tables_info,
+                "tools": "{tools}",
+                "tool_names": "{tool_names}"
+            }
+        )
 
         # Initialize conversation memory manager
         self.conversation_memory_manager = ConversationMemoryManager()
@@ -430,25 +710,25 @@ class TelemetryAgent:
             embeddings=self.embeddings
         )
 
-        # Set up agent chain with tools and memory
-        memory, _ = await self.conversation_memory_manager.aget_memory()
+        # Set up ReAct agent with tools
         tools: List[Tool] = [query_duckdb_tool, analyze_stats_tool, detect_anomalies_ml_tool]
-        agent = create_openai_tools_agent(
+
+         # Create ReAct agent
+        agent = create_react_agent(
             llm=self.llm,
             tools=tools,
             prompt=self.prompt
         )
-        executor = AgentExecutor(
+
+        # Create agent executor without memory (we'll handle memory manually)
+        self.agent_executor = AgentExecutor(
             agent=agent,
             tools=tools,
-            memory=memory,
-            verbose=False
+            verbose=True, 
+            handle_parsing_errors="Check your tool input format. It should be valid JSON with proper key-value pairs. For example: {\"db_path\": \"/path/to/file.duckdb\", \"query\": \"SELECT * FROM table\"}",
+            max_iterations=10,  # Prevent infinite loops
+            max_execution_time=120  # 2 minute timeout per execution
         )
-        self.agent_chain = RunnableMap({
-            "input": lambda x: x["input"],
-            "chat_history": lambda _: memory.load_memory_variables({})["chat_history"],
-            "tables": lambda _: self.get_tables_as_string(),
-        }) | self.prompt | executor
 
     def _validate_token_limits(self) -> None:
         """Validate token-related configurations.
@@ -485,18 +765,76 @@ class TelemetryAgent:
                 f"max_tokens {self.max_tokens} must be greater than RESERVED_RESPONSE_TOKENS {RESERVED_RESPONSE_TOKENS}"
             )
 
-    async def get_tables_as_string(self) -> str:
-        """Generate a comma-separated string of available table names.
-
-        Args:
-            None
-
-        Returns:
-            str: Comma-separated list of table names from TELEMETRY_SCHEMA.
+    def _fetch_actual_schema_for_table(self, table_name: str) -> List[str]:
+        """Connects to DB and fetches actual column names for a given table.
+        Returns a list of column names, or an empty list if fetching fails or table not found.
         """
-        # Yield to event loop to maintain async responsiveness
-        await asyncio.sleep(0)
-        return ", ".join(meta["table"] for meta in TELEMETRY_SCHEMA)
+        actual_column_names: List[str] = []
+        try:
+            if not self.db_path or not os.path.exists(self.db_path):
+                self.logger.error(f"Database path is invalid or file does not exist for table {table_name}", db_path=self.db_path)
+                # No fallback to static schema here; if DB path is bad, we can't confirm anything.
+                return []
+
+            with duckdb.connect(self.db_path, read_only=True) as conn:
+                tables_result = conn.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'main';").fetchall()
+                available_tables = [t[0].lower() for t in tables_result]
+
+                if table_name.lower() in available_tables:
+                    columns_data = conn.execute(f"DESCRIBE {table_name};").fetchall()
+                    actual_column_names = [col_data[0] for col_data in columns_data]
+                    self.logger.info(f"Dynamically fetched schema for {table_name}", columns=actual_column_names, db_path=self.db_path)
+                else:
+                    self.logger.warning(f"Table {table_name} from TELEMETRY_SCHEMA not found in DB {self.db_path}. It will NOT be included in the agent's list of available tables.")
+                    actual_column_names = [] # Explicitly empty, no static fallback here
+        except duckdb.Error as e:
+            self.logger.error(f"DuckDB error when trying to determine schema for {table_name} from {self.db_path}", error=str(e))
+            actual_column_names = [] # No static fallback on error
+            self.logger.warning(f"Could not determine schema for {table_name} due to DuckDB error. It will be treated as unavailable for the agent's direct table list.")
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching schema for {table_name} from {self.db_path}", error=str(e), error_type=str(type(e)))
+            actual_column_names = [] # No static fallback on error
+            self.logger.warning(f"Could not determine schema for {table_name} due to unexpected error. It will be treated as unavailable for the agent's direct table list.")
+        
+        if not actual_column_names and os.path.exists(self.db_path or ""): # Log only if db_path was valid
+             # This log might be redundant if already logged that table was not found or error occurred.
+             # Consider if this specific log "Could not determine columns..." is still needed if the cases above are clear.
+             pass # Keeping it for now, but can be removed if too noisy.
+             # self.logger.warning(f"Final check: Columns for table {table_name} are empty.", db_path=self.db_path)
+
+        return actual_column_names
+
+    async def get_tables_as_string(self) -> str:
+        """Generate a comma-separated string of available table names with their columns.
+        Columns are fetched dynamically from the DB, with fallback to static TELEMETRY_SCHEMA.
+        """
+        table_strings: List[str] = []
+        # Iterate through the tables defined in the static TELEMETRY_SCHEMA
+        # as it also contains useful metadata like descriptions and anomaly hints.
+        for table_meta_static in TELEMETRY_SCHEMA:
+            table_name = table_meta_static["table"]
+            
+            # Fetch actual column names dynamically using the helper method
+            # Run the synchronous DB operation in a separate thread
+            actual_columns = await asyncio.to_thread(self._fetch_actual_schema_for_table, table_name)
+            
+            if actual_columns: # If columns were found (either dynamic or fallback)
+                column_names_str = ", ".join(actual_columns)
+                table_strings.append(f"{table_name}({column_names_str})")
+            else:
+                # If no columns could be determined for this table from TELEMETRY_SCHEMA, log and omit.
+                self.logger.warning(
+                    f"No columns determined for table '{table_name}' from TELEMETRY_SCHEMA " +
+                    f"(via dynamic fetch or static fallback from {self.db_path}). Omitting from prompt schema string."
+                )
+        
+        if not table_strings:
+            self.logger.error("No tables could be processed to form the schema string for the prompt. Agent might not have table info.", db_path=self.db_path)
+            return "Error: No table schema information could be loaded."
+
+        final_schema_string = ", ".join(table_strings)
+        self.logger.info("Generated table schema string for prompt using dynamic fetching (with fallback)", schema_string_snippet=final_schema_string[:500])
+        return final_schema_string
 
     async def process_message(
         self, message: str, max_tokens: Optional[int] = None
@@ -549,6 +887,7 @@ class TelemetryAgent:
 
             # Retrieve conversation memory
             memory, memory_strategy = await self.conversation_memory_manager.aget_memory()
+            chat_history = memory.load_memory_variables({}).get("chat_history", [])
 
             # Identify relevant tables and hints using vector store
             search_results = await self.vector_store_manager.asimilarity_search(
@@ -560,20 +899,33 @@ class TelemetryAgent:
             anomaly_hints: List[str] = [
                 result.metadata.get("anomaly_hint", "") for result in search_results if result.metadata.get("anomaly_hint")
             ]
-            self.logger.info("Identified relevant tables and hints", tables=relevant_tables, hints=anomaly_hints)
 
-            # Prepare input with context for LLM
+            # Prepare enhanced input with context
+            enhanced_message = f"{message}\n\nContext:\n- Relevant tables: {', '.join(relevant_tables)}\n- Anomaly detection hints: {', '.join(anomaly_hints)}\n- Database path: {self.db_path}"
+            
+            # Add chat history context if available
+            if chat_history:
+                history_summary = "\n- Previous conversation context available"
+                enhanced_message += history_summary
+
+            # Prepare input data for ReAct agent
             input_data: Dict[str, str] = {
-                "input": f"{message}\nRelevant tables: {', '.join(relevant_tables)}\nAnomaly hints: {', '.join(anomaly_hints)}\nDatabase path: {self.db_path}",
+                "input": enhanced_message,
+                "agent_scratchpad_content": self.scratchpad.to_string()
             }
 
             # Execute agent chain
             async def run_executor() -> Dict[str, Any]:
-                return await self.agent_chain.ainvoke({
-                    "input": input_data["input"],
-                    "chat_history": memory.load_memory_variables({})["chat_history"],
-                    "tables": await self.get_tables_as_string()
-                })
+                self.logger.debug("ReAct agent input", input_data=input_data)
+                result = await self.agent_executor.ainvoke(input_data)
+
+                # Add intermediate steps to scratchpad
+                intermediate_steps = result.get("intermediate_steps", [])
+                for step in intermediate_steps:
+                    self.scratchpad.add_step(step)
+                    self.logger.debug("Added step to scratchpad", step=step)
+
+                return result
 
             result: Dict[str, Any] = await asyncio.wait_for(
                 run_executor(),
@@ -594,17 +946,29 @@ class TelemetryAgent:
             # Update conversation memory
             await self.conversation_memory_manager.add_message((message, response))
 
+            # Estimate tokens for scratchpad content
+            scratchpad_content = self.scratchpad.to_string()
+            scratchpad_tokens = len(self.token_encoder.encode(scratchpad_content))
+            if scratchpad_tokens > self.max_context_tokens // 2:
+                self.logger.warning(
+                    "Scratchpad content approaching token limit",
+                    tokens=scratchpad_tokens,
+                    max_context_tokens=self.max_context_tokens
+                )
+                # Optionally truncate scratchpad (e.g., keep last N steps)
+                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:]
+                self.logger.info("Truncated scratchpad to last 10 steps to manage token limit")
+
             # Compile metadata
             metadata: Dict[str, Any] = {
                 "relevant_tables": relevant_tables,
                 "anomaly_hints": anomaly_hints,
-                "query": (
-                    result.get("intermediate_steps", [{}])[-1].get("query", "")
-                    if result.get("intermediate_steps") else ""
-                ),
+                "intermediate_steps": result.get("intermediate_steps", []),
                 "token_usage": self.token_callback.token_usage,
                 "memory_strategy": memory_strategy.value,
-                "is_clarification": is_clarification
+                "is_clarification": is_clarification,
+                "agent_scratchpad": self.scratchpad.to_string(),
+                "agent_type": "react"
             }
 
             self.logger.info(

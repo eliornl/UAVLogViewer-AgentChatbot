@@ -4,13 +4,13 @@ import asyncio
 import structlog
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.memory import (
-    ConversationBufferMemory,
+    ConversationBufferWindowMemory,
     ConversationSummaryBufferMemory,
     ConversationEntityMemory,
     CombinedMemory,
 )
 from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_community.retrievers import TimeWeightedVectorStoreRetriever
+from langchain.retrievers import TimeWeightedVectorStoreRetriever
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from backend.llm_token_counter import LLMTokenCounter
@@ -19,7 +19,11 @@ logger = structlog.get_logger(__name__)
 
 # Type aliases for clarity
 MessagePair: TypeAlias = Tuple[str, str]
-MemoryType: TypeAlias = Union[ConversationBufferMemory, ConversationSummaryBufferMemory, CombinedMemory]
+MemoryType: TypeAlias = Union[
+    ConversationBufferWindowMemory,
+    ConversationSummaryBufferMemory,
+    CombinedMemory
+]
 DocumentList: TypeAlias = List[Document]
 
 # Constants
@@ -34,7 +38,7 @@ class MemoryStrategy(Enum):
     SHORT_TERM = "buffer_memory"
     MEDIUM_TERM = "summarized_memory"
     ADVANCED = "enhanced_context_memory"
-    FALLBACK = "minimal_context_memory"
+    FALLBACK = "fallback_context_memory"
 
 class ConversationMemoryManager:
     """Manages conversation history and memory strategies asynchronously based on token count.
@@ -139,7 +143,7 @@ class ConversationMemoryManager:
                     )
 
             await asyncio.wait_for(
-                update_memory(),
+                asyncio.create_task(update_memory()),
                 timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
             )
         except asyncio.TimeoutError:
@@ -189,7 +193,8 @@ class ConversationMemoryManager:
             llm=self.llm,
             max_token_limit=self.fallback_token_limit,
             memory_key="chat_history",
-            chat_memory=ChatMessageHistory()
+            chat_memory=ChatMessageHistory(),
+            return_messages=True
         )
         recent_messages: List[MessagePair] = []
         current_tokens: int = 0
@@ -202,7 +207,7 @@ class ConversationMemoryManager:
                 break
         recent_messages.reverse()
 
-        async def load_messages() -> None:
+        def load_messages() -> None:
             for user_content, assistant_content in recent_messages:
                 memory.chat_memory.add_user_message(user_content)
                 memory.chat_memory.add_ai_message(assistant_content)
@@ -216,26 +221,27 @@ class ConversationMemoryManager:
 
     async def _initialize_short_term_memory(
         self, history: List[MessagePair]
-    ) -> Tuple[ConversationBufferMemory, MemoryStrategy]:
+    ) -> Tuple[ConversationBufferWindowMemory, MemoryStrategy]:
         """Initialize short-term memory asynchronously for low token counts.
 
         Args:
             history: List of (user_content, assistant_content) tuples.
 
         Returns:
-            Tuple[ConversationBufferMemory, MemoryStrategy]: Short-term memory and strategy.
+            Tuple[ConversationBufferWindowMemory, MemoryStrategy]: Short-term memory and strategy.
 
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
-        self.logger.info("Initialized SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT)
-        memory = ConversationBufferMemory(
+        self.logger.info("Initializing SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT)
+        memory = ConversationBufferWindowMemory(
             memory_key="chat_history",
             return_messages=True,
-            chat_memory=ChatMessageHistory()
+            chat_memory=ChatMessageHistory(),
+            k=10  # Store the last 10 messages
         )
 
-        async def load_messages() -> None:
+        def load_messages() -> None:
             for user_content, assistant_content in history:
                 memory.chat_memory.add_user_message(user_content)
                 memory.chat_memory.add_ai_message(assistant_content)
@@ -244,6 +250,7 @@ class ConversationMemoryManager:
             asyncio.to_thread(load_messages),
             timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
+        self.logger.info("Initialized SHORT_TERM memory", message_count=len(history))
         return memory, MemoryStrategy.SHORT_TERM
 
     async def _initialize_medium_term_memory(
@@ -260,20 +267,22 @@ class ConversationMemoryManager:
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
-        self.logger.info("Initialized MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
-        buffer_memory = ConversationBufferMemory(
-            memory_key="chat_history",
+        self.logger.info("Initializing MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
+        buffer_memory = ConversationBufferWindowMemory(
+            memory_key="buffer_history",
             return_messages=True,
-            chat_memory=ChatMessageHistory()
+            chat_memory=ChatMessageHistory(),
+            k=10  # Store the last 10 messages
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=SHORT_TERM_TOKEN_LIMIT,
-            memory_key="chat_history",
-            chat_memory=ChatMessageHistory()
+            memory_key="summary_history",
+            chat_memory=ChatMessageHistory(),
+            return_messages=True
         )
 
-        async def load_messages() -> None:
+        def load_messages() -> None:
             for user_content, assistant_content in history:
                 buffer_memory.chat_memory.add_user_message(user_content)
                 buffer_memory.chat_memory.add_ai_message(assistant_content)
@@ -285,9 +294,9 @@ class ConversationMemoryManager:
             timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
         combined_memory = CombinedMemory(
-            memories=[buffer_memory, summary_memory],
-            memory_key="chat_history"
+            memories=[buffer_memory, summary_memory]
         )
+        self.logger.info("Initialized MEDIUM_TERM memory", message_count=len(history))
         return combined_memory, MemoryStrategy.MEDIUM_TERM
 
     async def _initialize_advanced_memory(
@@ -311,25 +320,28 @@ class ConversationMemoryManager:
         self.logger.info("Initializing ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
 
         # Initialize memory components
-        buffer_memory = ConversationBufferMemory(
-            memory_key="chat_history",
+        buffer_memory = ConversationBufferWindowMemory(
+            memory_key="buffer_history",
             return_messages=True,
-            chat_memory=ChatMessageHistory()
+            chat_memory=ChatMessageHistory(),
+            k=10  # Store the last 10 messages
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=MEDIUM_TERM_TOKEN_LIMIT,
-            memory_key="chat_history",
-            chat_memory=ChatMessageHistory()
+            memory_key="summary_history",
+            chat_memory=ChatMessageHistory(),
+            return_messages=True
         )
         entity_memory = ConversationEntityMemory(
             llm=self.llm,
-            memory_key="chat_history"
+            memory_key="entity_history",
+            return_messages=True
         )
 
         # Load messages and build documents
         documents: DocumentList = []
-        async def load_messages() -> None:
+        def load_messages() -> None:
             for user_content, assistant_content in history:
                 buffer_memory.chat_memory.add_user_message(user_content)
                 buffer_memory.chat_memory.add_ai_message(assistant_content)
@@ -350,7 +362,7 @@ class ConversationMemoryManager:
 
         # Create FAISS vector store for conversation history
         try:
-            async def init_vector_store() -> FAISS:
+            def init_vector_store() -> FAISS:
                 if not self.embeddings:
                     raise ValueError("Embeddings not initialized")
                 return FAISS.from_documents(documents, self.embeddings)
@@ -369,12 +381,12 @@ class ConversationMemoryManager:
             decay_rate=VECTOR_RETRIEVER_DECAY_RATE,
             k=VECTOR_RETRIEVER_K
         )
-        vector_memory = retriever.as_memory(memory_key="chat_history")
+        vector_memory = retriever.as_memory(memory_key="vector_history", return_messages=True)
 
         combined_memory = CombinedMemory(
-            memories=[buffer_memory, summary_memory, entity_memory, vector_memory],
-            memory_key="chat_history"
+            memories=[buffer_memory, summary_memory, entity_memory, vector_memory]
         )
+        self.logger.info("Initialized ADVANCED memory", message_count=len(history))
         return combined_memory, MemoryStrategy.ADVANCED
 
     async def _initialize_memory(
@@ -410,4 +422,6 @@ class ConversationMemoryManager:
         Raises:
             ValueError: If manager is not initialized.
         """
+        if self.memory is None or self.memory_strategy is None:
+            raise ValueError("Memory not initialized")
         return self.memory, self.memory_strategy

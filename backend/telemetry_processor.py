@@ -6,7 +6,7 @@ import duckdb
 import pandas as pd
 import structlog
 from pymavlink import mavutil
-from tenacity import async_retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential
 from backend.models import Session, SessionStatus
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -61,7 +61,7 @@ class TelemetryProcessor:
             return "VARCHAR"
 
     @staticmethod
-    @async_retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     async def parse_and_save(
         file_path: str,
         session: Session,
@@ -87,18 +87,18 @@ class TelemetryProcessor:
             duckdb.IOException: If DuckDB database operations fail.
             asyncio.TimeoutError: If parsing or saving exceeds timeouts.
         """
-        logger = logger.bind(session_id=session.session_id, file_name=session.file_name)
+        session_logger = logger.bind(session_id=session.session_id, file_name=session.file_name)
         try:
             # Validate file path to prevent path traversal and ensure file exists
-            if not os.path.isfile(file_path) or ".." in os.path.relpath(file_path):
+            if not os.path.isfile(file_path):
                 session.status = SessionStatus.ERROR
                 session.status_message = "Invalid file path provided"
-                logger.error("Invalid file path", file_path=file_path)
+                session_logger.error("Invalid file path", file_path=file_path)
                 raise ValueError(f"Invalid file path: {file_path}")
 
             # Initialize MAVLink log file parser
-            async def init_mav() -> Any:
-                return mavutil.mavlogfile(file_path, zero_time_base=True)
+            def init_mav() -> Any:
+                return mavutil.mavlogfile(file_path)
 
             try:
                 mav = await asyncio.wait_for(
@@ -108,7 +108,7 @@ class TelemetryProcessor:
             except Exception as e:
                 session.status = SessionStatus.ERROR
                 session.status_message = f"Invalid telemetry file: {str(e)}"
-                logger.error("Failed to initialize MAVLink file", error=str(e))
+                session_logger.error("Failed to initialize MAVLink file", error=str(e))
                 raise ValueError(f"Invalid telemetry file: {str(e)}") from e
 
             # Initialize data storage for each message type
@@ -117,7 +117,7 @@ class TelemetryProcessor:
             }
 
             # Parse all messages from the log file
-            async def parse_messages() -> None:
+            def parse_messages() -> None:
                 while True:
                     msg = mav.recv_msg()
                     if msg is None:
@@ -133,12 +133,12 @@ class TelemetryProcessor:
             )
 
             # Create and save DataFrames for each message type
-            async def save_to_duckdb() -> None:
+            def save_to_duckdb() -> None:
                 # Prepare DuckDB database path
                 os.makedirs(storage_dir, exist_ok=True)
                 db_path = os.path.join(storage_dir, f"{db_prefix}{session.session_id}.duckdb")
                 if ".." in os.path.relpath(db_path, storage_dir):
-                    logger.error("Invalid database path", db_path=db_path)
+                    session_logger.error("Invalid database path", db_path=db_path)
                     raise ValueError(f"Invalid database path: {db_path}")
 
                 # Connect to DuckDB
@@ -146,14 +146,14 @@ class TelemetryProcessor:
                     for msg_type in TelemetryProcessor.TELEMETRY_MESSAGE_TYPES:
                         messages = telemetry_data[msg_type]
                         if not messages:
-                            logger.debug("No messages for type", msg_type=msg_type)
+                            session_logger.debug("No messages for type", msg_type=msg_type)
                             continue
 
                         # Create DataFrame
                         try:
                             df = pd.DataFrame(messages)
                         except Exception as e:
-                            logger.error(
+                            session_logger.error(
                                 "Failed to create DataFrame for message type",
                                 msg_type=msg_type,
                                 error=str(e)
@@ -172,34 +172,46 @@ class TelemetryProcessor:
                             f"{col} {TelemetryProcessor.map_dtype(df[col].dtype)}" for col in df.columns
                         ]
 
-                        # Create table (assumes table does not exist)
-                        logger.debug("Creating table", table_name=table_name, db_path=db_path)
-                        create_table_query = f"""
-                        CREATE TABLE {table_name} (
-                            {', '.join(columns)}
-                        )
-                        """
-                        try:
-                            conn.execute(create_table_query)
-                        except duckdb.CatalogException as e:
-                            logger.error(
-                                "Failed to create table: table already exists",
-                                table_name=table_name,
-                                db_path=db_path,
-                                error=str(e)
-                            )
-                            raise duckdb.IOException(
-                                f"Failed to create table {table_name}: table already exists in {db_path}"
-                            ) from e
+                        # Check if the table exists
+                        table_exists = conn.execute(
+                            "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?", (table_name,)
+                        ).fetchone()[0] > 0
 
-                        # Insert data into table
-                        conn.execute(f"INSERT INTO {table_name} SELECT * FROM df", {'df': df})
-                        logger.info(
+                        # Create table if it doesn't exist
+                        if not table_exists:
+                            session_logger.debug("Creating table", table_name=table_name, db_path=db_path)
+                            quoted_table_name = f'"{table_name}"'
+                            create_table_query = f"""
+                            CREATE TABLE {quoted_table_name} (
+                                {', '.join(columns)}
+                            )
+                            """
+                            try:
+                                conn.execute(create_table_query)
+                            except Exception as e:
+                                session_logger.error(
+                                    "Failed to create table",
+                                    table_name=table_name,
+                                    db_path=db_path,
+                                    error=str(e)
+                                )
+                                raise duckdb.IOException(
+                                    f"Failed to create table {table_name} in {db_path}: {str(e)}"
+                                ) from e
+                        else:
+                            session_logger.debug("Table exists, will append data", table_name=table_name)
+
+                        # Insert data into table via temporary view
+                        conn.register('df_view', df)
+                        conn.execute(f"INSERT INTO {quoted_table_name} SELECT * FROM df_view")
+                        conn.unregister('df_view')
+                        session_logger.info(
                             "Saved telemetry data",
                             table_name=table_name,
                             msg_type=msg_type,
                             row_count=len(df)
                         )
+                        conn.commit()
 
             try:
                 await asyncio.wait_for(
@@ -209,7 +221,7 @@ class TelemetryProcessor:
             except asyncio.TimeoutError:
                 session.status = SessionStatus.ERROR
                 session.status_message = f"DuckDB save timed out after {TelemetryProcessor.SAVE_TIMEOUT_SECONDS} seconds"
-                logger.error("DuckDB save timed out", timeout=TelemetryProcessor.SAVE_TIMEOUT_SECONDS)
+                session_logger.error("DuckDB save timed out", timeout=TelemetryProcessor.SAVE_TIMEOUT_SECONDS)
                 raise duckdb.IOException(
                     f"DuckDB save timed out after {TelemetryProcessor.SAVE_TIMEOUT_SECONDS} seconds"
                 )
@@ -217,25 +229,25 @@ class TelemetryProcessor:
             # Update session status to READY upon successful completion
             session.status = SessionStatus.READY
             session.status_message = "Ready for chat"
-            logger.info("Session status updated to READY")
+            session_logger.info("Session status updated to READY")
 
         except asyncio.TimeoutError as e:
             session.status = SessionStatus.ERROR
             session.status_message = f"Operation timed out: {str(e)}"
-            logger.error("Operation timed out", error=str(e))
+            session_logger.error("Operation timed out", error=str(e))
             raise ValueError(f"Operation timed out: {str(e)}") from e
         except (OSError, duckdb.IOException) as e:
             session.status = SessionStatus.ERROR
             session.status_message = f"File or database error: {str(e)}"
-            logger.error("File or database error", error=str(e))
+            session_logger.error("File or database error", error=str(e))
             raise OSError(f"File or database operation failed: {str(e)}") from e
         except ValueError as e:
-            logger.error("Parsing failed", error=str(e))
+            session_logger.error("Parsing failed", error=str(e))
             raise ValueError(f"Telemetry parsing failed: {str(e)}") from e
         except Exception as e:
             session.status = SessionStatus.ERROR
             session.status_message = f"Unexpected error during telemetry processing: {str(e)}"
-            logger.error(
+            session_logger.error(
                 "Unexpected error during telemetry processing",
                 error_type=type(e).__name__,
                 error=str(e),

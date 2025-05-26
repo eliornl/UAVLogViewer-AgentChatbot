@@ -7,6 +7,7 @@ import time
 import aiofiles
 import mimetypes
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Set, Optional, AsyncGenerator, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
@@ -65,9 +66,6 @@ CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1048576"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 MAX_SESSION_ATTEMPTS: int = int(os.getenv("MAX_SESSION_ATTEMPTS", "5"))
 DUCKDB_FILE_PREFIX: str = os.getenv("DUCKDB_FILE_PREFIX", "")
-ALLOWED_MIME_TYPES: Set[str] = set(
-    os.getenv("ALLOWED_MIME_TYPES", "application/octet-stream,text/plain").split(",")
-)
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
 CHAT_TIMEOUT_SECONDS: float = float(os.getenv("CHAT_TIMEOUT_SECONDS", "30"))
@@ -113,18 +111,24 @@ except Exception as e:
     logger.error("Failed to initialize OpenAIEmbeddings", error=str(e), exc_info=True)
     raise ValueError(f"Failed to initialize OpenAIEmbeddings: {str(e)}") from e
 
-# Initialize VectorStoreManager
-try:
-    vector_store_manager: VectorStoreManager = VectorStoreManager(embeddings=embeddings)
-    # Run initialization synchronously at startup to ensure vector store is ready
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(vector_store_manager.initialize())
-except Exception as e:
-    logger.error("Failed to initialize VectorStoreManager", error=str(e), exc_info=True)
-    raise ValueError(f"Failed to initialize VectorStoreManager: {str(e)}") from e
+# Lifespan event handler for startup and shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global vector_store_manager
+    # Startup: Initialize VectorStoreManager
+    try:
+        vector_store_manager = VectorStoreManager(embeddings=embeddings)
+        await vector_store_manager.initialize()
+        logger.info("VectorStoreManager initialized successfully")
+    except Exception as e:
+        logger.error("Failed to initialize VectorStoreManager", error=str(e), exc_info=True)
+        raise ValueError(f"Failed to initialize VectorStoreManager: {str(e)}") from e
+    yield
+    # Shutdown: Clean up resources (if needed)
+    logger.info("Shutting down application")
 
 # Initialize FastAPI app
-app: FastAPI = FastAPI(title="AeroTelemetry AI Analysis API")
+app = FastAPI(title="AeroTelemetry AI Analysis API", lifespan=lifespan)
 
 # Apply CORS middleware
 app.add_middleware(
@@ -166,15 +170,6 @@ async def validate_file(file: UploadFile) -> Tuple[str, str, int]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid file extension. Allowed: {ALLOWED_EXTENSIONS}",
-        )
-
-    mime_type: Optional[str]
-    mime_type, _ = mimetypes.guess_type(file.filename)
-    if mime_type is None or mime_type not in ALLOWED_MIME_TYPES:
-        logger.error("Invalid MIME type", file_name=sanitized_filename, mime_type=mime_type)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid MIME type. Allowed: {ALLOWED_MIME_TYPES}",
         )
 
     file_size: int = file.size or 0
@@ -363,39 +358,29 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
                 session_id: str = str(uuid.uuid4())
                 attempt: int = 0
                 while session_id in sessions and attempt < MAX_SESSION_ATTEMPTS:
-                    logger.warning(
-                        "Session ID collision", session_id=session_id, attempt=attempt
-                    )
+                    logger.warning("Session ID collision", session_id=session_id, attempt=attempt)
                     session_id = str(uuid.uuid4())
                     attempt += 1
                 if session_id in sessions:
-                    logger.error(
-                        "Failed to generate unique session ID",
-                        max_attempts=MAX_SESSION_ATTEMPTS,
-                    )
+                    logger.error("Failed to generate unique session ID", max_attempts=MAX_SESSION_ATTEMPTS)
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Failed to generate unique session ID",
                     )
 
-                session: Session = await create_session(
-                    sanitized_filename, file_size, session_id
-                )
-                logger = logger.bind(session_id=session_id)
-                db_path: str = os.path.join(
-                    STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb"
-                )
+                session: Session = await create_session(sanitized_filename, file_size, session_id)
+                session_logger = logger.bind(session_id=session_id)
+
+                db_path: str = os.path.join(STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{session_id}.duckdb")
                 if os.path.exists(db_path):
-                    logger.error("DuckDB file already exists", db_path=db_path)
+                    session_logger.error("DuckDB file already exists", db_path=db_path)
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT, detail="Session ID conflict"
                     )
 
             try:
-                await TelemetryProcessor.parse_and_save(
-                    tmp_file_path, session, STORAGE_DIR, DUCKDB_FILE_PREFIX
-                )
-                logger.info(
+                await TelemetryProcessor.parse_and_save(tmp_file_path, session, STORAGE_DIR, DUCKDB_FILE_PREFIX)
+                session_logger.info(
                     "Session processing completed",
                     session_status=session.status,
                     status_message=session.status_message,
@@ -410,7 +395,7 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
                     request_duration=time.perf_counter() - start_time,
                 )
             except ValueError as e:
-                logger.error("Parsing failed", error=str(e), exc_info=True)
+                session_logger.error("Parsing failed", error=str(e), exc_info=True)
                 return UploadResponse(
                     timestamp=session.created_at,
                     file_name=sanitized_filename,
@@ -421,7 +406,7 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
                     request_duration=time.perf_counter() - start_time,
                 )
             except (OSError, duckdb.IOException) as e:
-                logger.error("File or database error", error=str(e), exc_info=True)
+                session_logger.error("File or database error", error=str(e), exc_info=True)
                 return UploadResponse(
                     timestamp=session.created_at,
                     file_name=sanitized_filename,
@@ -432,17 +417,18 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
                     request_duration=time.perf_counter() - start_time,
                 )
         finally:
-            await cleanup_temp_file(tmp_file_path, logger, sanitized_filename)
+            await cleanup_temp_file(tmp_file_path, session_logger if 'session_logger' in locals() else logger, sanitized_filename)
 
 async def initialize_agent(
-    session_id: str, db_path: str, start_time: float
+    session_id: str, db_path: str, max_tokens: int, max_start_time: float
 ) -> Optional[TelemetryAgent]:
     """Initialize or retrieve a TelemetryAgent for a session.
 
     Args:
         session_id: Session ID for the agent.
         db_path: Path to DuckDB file for the session.
-        start_time: Request start time for duration tracking.
+        max_tokens: Maximum number of tokens for the agent.
+        max_start_time: Maximum start time for the agent.
 
     Returns:
         Optional[TelemetryAgent]: Initialized or existing agent, or None if initialization fails.
@@ -452,10 +438,12 @@ async def initialize_agent(
             agent: TelemetryAgent = TelemetryAgent(
                 session_id=session_id,
                 db_path=db_path,
+                openai_api_key=OPENAI_API_KEY,
                 llm_model=LLM_MODEL,
                 token_encoder=token_counter,
                 vector_store_manager=vector_store_manager,
                 embeddings=embeddings,
+                max_tokens=max_tokens
             )
             await agent.async_initialize()
             agents[session_id] = agent
@@ -530,13 +518,13 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
     """
     start_time: float = time.perf_counter()
     validate_uuid(request.session_id)
-    logger = logger.bind(session_id=request.session_id)
+    session_logger = logger.bind(session_id=request.session_id)
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
     async with global_sessions_lock:
         if request.session_id not in sessions:
-            logger.error("Session not found", session_id=request.session_id)
+            session_logger.error("Session not found", session_id=request.session_id)
             return ChatResponse(
                 timestamp=datetime.now(timezone.utc),
                 session_id=request.session_id,
@@ -552,7 +540,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
     async with session_lock:
         session: Session = sessions[request.session_id]
         if len(session.messages) >= MAX_MESSAGES:
-            logger.error(
+            session_logger.error(
                 "Maximum messages reached",
                 session_id=request.session_id,
                 max_messages=MAX_MESSAGES,
@@ -579,7 +567,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
             STORAGE_DIR, f"{DUCKDB_FILE_PREFIX}{request.session_id}.duckdb"
         )
         agent: Optional[TelemetryAgent] = await initialize_agent(
-            request.session_id, db_path, start_time
+            request.session_id, db_path, request.max_tokens, start_time
         )
         if not agent:
             return ChatResponse(
@@ -601,7 +589,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
             timestamp=datetime.now(timezone.utc),
         )
         session.messages.append(user_message)
-        logger.debug(
+        session_logger.debug(
             "Saved user message to session",
             session_id=request.session_id,
             message_id=message_id,
@@ -624,7 +612,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
                 metadata=metadata,
             )
             session.messages.append(assistant_message)
-            logger.info(
+            session_logger.info(
                 "Processed chat message",
                 session_id=request.session_id,
                 message_id=message_id,
@@ -642,7 +630,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
                 request_duration=time.perf_counter() - start_time,
             )
         except asyncio.TimeoutError:
-            logger.error(
+            session_logger.error(
                 "Chat processing timed out",
                 session_id=request.session_id,
                 timeout=CHAT_TIMEOUT_SECONDS,
@@ -657,7 +645,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
                 request_duration=time.perf_counter() - start_time,
             )
         except ValueError as e:
-            logger.error(
+            session_logger.error(
                 "Invalid chat request", session_id=request.session_id, error=str(e)
             )
             return ChatResponse(
@@ -670,7 +658,7 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
                 request_duration=time.perf_counter() - start_time,
             )
         except Exception as e:
-            logger.error(
+            session_logger.error(
                 "Failed to process chat message",
                 session_id=request.session_id,
                 error=str(e),

@@ -112,7 +112,7 @@ class LLMTokenCounter:
         )
         return total_tokens
 
-    def encode_text(self, text: str) -> List[int]:
+    def encode(self, text: str) -> List[int]:
         """Encode a single text string into tokens.
 
         Args:
