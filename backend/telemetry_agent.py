@@ -785,7 +785,7 @@ class TelemetryAgent:
                     actual_column_names = [col_data[0] for col_data in columns_data]
                     self.logger.info(f"Dynamically fetched schema for {table_name}", columns=actual_column_names, db_path=self.db_path)
                 else:
-                    self.logger.warning(f"Table {table_name} from TELEMETRY_SCHEMA not found in DB {self.db_path}. It will NOT be included in the agent's list of available tables.")
+                    self.logger.debug(f"Table {table_name} from TELEMETRY_SCHEMA not found in DB {self.db_path}. It will NOT be included in the agent's list of available tables.")
                     actual_column_names = [] # Explicitly empty, no static fallback here
         except duckdb.Error as e:
             self.logger.error(f"DuckDB error when trying to determine schema for {table_name} from {self.db_path}", error=str(e))
@@ -823,9 +823,10 @@ class TelemetryAgent:
                 table_strings.append(f"{table_name}({column_names_str})")
             else:
                 # If no columns could be determined for this table from TELEMETRY_SCHEMA, log and omit.
-                self.logger.warning(
+                # Changed from warning to debug as this is expected if table not in DB
+                self.logger.debug(
                     f"No columns determined for table '{table_name}' from TELEMETRY_SCHEMA " +
-                    f"(via dynamic fetch or static fallback from {self.db_path}). Omitting from prompt schema string."
+                    f"(via dynamic fetch from {self.db_path}). Omitting from prompt schema string."
                 )
         
         if not table_strings:
@@ -917,13 +918,65 @@ class TelemetryAgent:
             # Execute agent chain
             async def run_executor() -> Dict[str, Any]:
                 self.logger.debug("ReAct agent input", input_data=input_data)
-                result = await self.agent_executor.ainvoke(input_data)
+                # Ensure that the agent_scratchpad is passed correctly
+                current_scratchpad_content = self.scratchpad.to_string()
+                input_data_with_scratchpad = {
+                    "input": enhanced_message, # This already includes 'enhanced_message' from above
+                    "agent_scratchpad": current_scratchpad_content # Pass the current scratchpad content directly
+                }
+                # The REACT_SYSTEM_PROMPT template uses {agent_scratchpad} which is where LangChain injects history/intermediate steps.
+                # My manual `agent_scratchpad_content` was for the separate variable in the prompt.
+                # The actual intermediate steps are handled by AgentExecutor.
+                # So, the agent_scratchpad argument to .ainvoke should be a string representation of previous steps.
+                # This is typically handled internally by Langchain if memory is part of the agent.
+                # For ReAct, the intermediate steps are built up and passed in the 'agent_scratchpad' input variable.
+                
+                # Let's ensure the input to ainvoke is what create_react_agent expects for the {agent_scratchpad} variable.
+                # The agent_executor will fill "agent_scratchpad" with the history of thoughts and actions.
+                # My current `input_data` has "agent_scratchpad_content" for my custom prompt part,
+                # and "input" for the main question.
+                # The `create_react_agent`'s prompt has `{agent_scratchpad}` which is where it expects the sequence of
+                # Action, Action Input, Observation.
+
+                # Correct input for react agent:
+                react_input = {"input": enhanced_message, "agent_scratchpad": self.scratchpad.intermediate_steps}
+
+
+                # The AgentExecutor will internally manage the agent_scratchpad based on intermediate_steps.
+                # The input to agent_executor.ainvoke should primarily be "input".
+                # The prompt template has: Question: {input} Thought: {agent_scratchpad}
+
+                # So, the AgentExecutor expects 'input' and will populate 'agent_scratchpad'
+                # The 'agent_scratchpad_content' is my own addition for extra context.
+                
+                # Let's revert to simpler input for AgentExecutor if `scratchpad.intermediate_steps` is handled by it.
+                # The `create_react_agent` prompt expects "input" and "agent_scratchpad" (for thoughts/actions).
+                # `AgentExecutor` creates the `agent_scratchpad` string from `intermediate_steps`.
+                # My `REACT_SYSTEM_PROMPT` also includes `{agent_scratchpad_content}` which I manually populate.
+
+                # The input to `agent_executor.ainvoke` should be a dictionary containing
+                # all keys expected by the underlying agent's prompt, excluding 'agent_scratchpad'
+                # if it's internally managed, or including it if explicitly built.
+                # For `create_react_agent`, `agent_scratchpad` is the string of thoughts/actions.
+
+                final_input_for_executor = {
+                    "input": enhanced_message, # For {input} in prompt
+                    "agent_scratchpad_content": self.scratchpad.to_string() # For {agent_scratchpad_content}
+                }
+                # `agent_scratchpad` (for thought/action/observation chain) is managed by AgentExecutor
+
+                self.logger.debug("ReAct agent executor input", final_input_for_executor=final_input_for_executor)
+                result = await self.agent_executor.ainvoke(final_input_for_executor)
+
 
                 # Add intermediate steps to scratchpad
-                intermediate_steps = result.get("intermediate_steps", [])
-                for step in intermediate_steps:
-                    self.scratchpad.add_step(step)
-                    self.logger.debug("Added step to scratchpad", step=step)
+                # This is important for the next turn if the agent is stateful across multiple calls to process_message
+                # For ReAct, the scratchpad is built per call, based on iterations.
+                # My self.scratchpad is for multi-turn context, if I were to implement that more deeply.
+                # For now, intermediate_steps from the result are key for *this* call's analysis.
+                current_call_intermediate_steps = result.get("intermediate_steps", [])
+                # self.scratchpad.add_steps(current_call_intermediate_steps) # If we want to persist across calls
+                # self.logger.debug("Added steps from current call to persistent scratchpad", steps_count=len(current_call_intermediate_steps))
 
                 return result
 
@@ -946,28 +999,62 @@ class TelemetryAgent:
             # Update conversation memory
             await self.conversation_memory_manager.add_message((message, response))
 
-            # Estimate tokens for scratchpad content
-            scratchpad_content = self.scratchpad.to_string()
-            scratchpad_tokens = len(self.token_encoder.encode(scratchpad_content))
+            # Estimate tokens for scratchpad content from the current agent run
+            # The 'agent_scratchpad' in the result is the final scratchpad string used by the agent
+            agent_internal_scratchpad_str = result.get("agent_scratchpad", "")
+            if not agent_internal_scratchpad_str and isinstance(result.get("intermediate_steps"), list):
+                # Reconstruct scratchpad string if not directly available (though usually it is for react)
+                # This is complex, assume 'agent_scratchpad' or 'intermediate_steps' is primary.
+                pass # Prefer direct 'agent_scratchpad' or 'intermediate_steps'
+
+            # Let's use the `self.scratchpad` which is being updated for the custom context
+            # For overall context length management, consider all inputs to the LLM.
+            scratchpad_for_token_check = self.scratchpad.to_string() # Custom scratchpad
+            scratchpad_tokens = len(self.token_encoder.encode(scratchpad_for_token_check))
+
             if scratchpad_tokens > self.max_context_tokens // 2:
                 self.logger.warning(
-                    "Scratchpad content approaching token limit",
+                    "Custom scratchpad content approaching token limit",
                     tokens=scratchpad_tokens,
                     max_context_tokens=self.max_context_tokens
                 )
-                # Optionally truncate scratchpad (e.g., keep last N steps)
-                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:]
-                self.logger.info("Truncated scratchpad to last 10 steps to manage token limit")
+                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:] # Truncate custom
+                self.logger.info("Truncated custom scratchpad to last 10 steps to manage token limit")
 
+            # Sanitize intermediate_steps for logging to remove time_boot_ms from query_duckdb data
+            raw_intermediate_steps = result.get("intermediate_steps", [])
+            logged_intermediate_steps = []
+            for action, observation in raw_intermediate_steps:
+                if (action.tool == "query_duckdb" and
+                        isinstance(observation, dict) and
+                        observation.get("status") == "success" and
+                        isinstance(observation.get("data"), list)):
+                    
+                    new_observation_data = []
+                    for item in observation["data"]:
+                        if isinstance(item, dict):
+                            logged_item = item.copy()
+                            logged_item.pop('time_boot_ms', None)
+                            new_observation_data.append(logged_item)
+                        else:
+                            new_observation_data.append(item) # Should not happen with current query_duckdb
+                    
+                    logged_observation = observation.copy()
+                    logged_observation["data"] = new_observation_data
+                    logged_intermediate_steps.append((action, logged_observation))
+                else:
+                    logged_intermediate_steps.append((action, observation))
+            
             # Compile metadata
             metadata: Dict[str, Any] = {
                 "relevant_tables": relevant_tables,
                 "anomaly_hints": anomaly_hints,
-                "intermediate_steps": result.get("intermediate_steps", []),
+                "intermediate_steps": logged_intermediate_steps, # Use sanitized version for logging
                 "token_usage": self.token_callback.token_usage,
                 "memory_strategy": memory_strategy.value,
                 "is_clarification": is_clarification,
-                "agent_scratchpad": self.scratchpad.to_string(),
+                "agent_scratchpad_custom_context": self.scratchpad.to_string(), # Log the custom context scratchpad
+                "agent_internal_scratchpad_final": agent_internal_scratchpad_str, # Log agent's final scratchpad string
                 "agent_type": "react"
             }
 
