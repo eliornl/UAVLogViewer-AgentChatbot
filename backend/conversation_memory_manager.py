@@ -1,29 +1,25 @@
-from typing import List, Optional, Tuple, Union, TypeAlias
+from typing import List, Optional, Tuple, Union, TypeAlias, Dict, Any
 from enum import Enum
 import asyncio
 import structlog
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.memory import (
-    ConversationBufferWindowMemory,
-    ConversationSummaryBufferMemory,
-    ConversationEntityMemory,
     CombinedMemory,
+    ConversationSummaryBufferMemory,
+    ConversationEntityMemory
 )
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain.retrievers import TimeWeightedVectorStoreRetriever
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, trim_messages
+from langchain_core.memory import BaseMemory
 from backend.llm_token_counter import LLMTokenCounter
 
 logger = structlog.get_logger(__name__)
 
 # Type aliases for clarity
 MessagePair: TypeAlias = Tuple[str, str]
-MemoryType: TypeAlias = Union[
-    ConversationBufferWindowMemory,
-    ConversationSummaryBufferMemory,
-    CombinedMemory
-]
 DocumentList: TypeAlias = List[Document]
 
 # Constants
@@ -32,6 +28,81 @@ MEDIUM_TERM_TOKEN_LIMIT: int = 3000
 VECTOR_RETRIEVER_DECAY_RATE: float = 0.5
 VECTOR_RETRIEVER_K: int = 4
 MEMORY_UPDATE_TIMEOUT_SECONDS: float = 60.0  # Timeout for memory updates
+
+class CustomBufferWindowMemory(BaseMemory):
+    chat_memory: ChatMessageHistory
+    k: int = 10
+    memory_key: str = "history"
+    return_messages: bool = True
+    input_key: Optional[str] = None
+    output_key: Optional[str] = None
+
+    @property
+    def memory_variables(self) -> List[str]:
+        return [self.memory_key]
+
+    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+        messages = self.chat_memory.messages
+        # Use SystemMessage if present as the first message for include_system
+        # trim_messages expects a list of BaseMessage
+        
+        # Determine if a system message is present at the beginning
+        # For include_system=True, trim_messages handles preserving the first SystemMessage
+        
+        windowed_messages = trim_messages(
+            messages,
+            max_tokens=self.k, # k is number of messages here
+            token_counter=len, # Counts number of messages
+            strategy="last",
+            start_on="human", # Default, good for most chat models
+            include_system=True, # Preserves first system message if any
+            allow_partial=False, # Don't allow partial messages
+        )
+        
+        if self.return_messages:
+            return {self.memory_key: windowed_messages}
+        else:
+            # This part mimics how ConversationBufferMemory would format if not return_messages
+            # For now, we assume return_messages=True as per original usage
+            # If needed, this can be expanded later.
+            # For simplicity with return_messages=True, this branch might not be hit
+            # if ConversationBufferWindowMemory's string formatting is complex.
+            # The primary goal is to replicate the message windowing.
+            # buffer_string = get_buffer_string(windowed_messages, human_prefix=..., ai_prefix=...)
+            # return {self.memory_key: buffer_string}
+            # For now, let's stick to the return_messages=True path as that's what was used.
+            raise NotImplementedError("String buffer formatting not fully implemented for CustomBufferWindowMemory if return_messages=False")
+
+
+    def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
+        # This logic assumes inputs has one key (e.g. "input" or "human_input")
+        # and outputs has one key (e.g. "output" or "ai_output")
+        # This matches how LLMChain and agents typically save context.
+        
+        # Determine input message string
+        if self.input_key is None:
+            input_str = next(iter(inputs.values())) # Get the first value
+        else:
+            input_str = inputs[self.input_key]
+
+        # Determine output message string
+        if self.output_key is None:
+            output_str = next(iter(outputs.values())) # Get the first value
+        else:
+            output_str = outputs[self.output_key]
+            
+        self.chat_memory.add_user_message(input_str)
+        self.chat_memory.add_ai_message(output_str)
+
+
+    def clear(self) -> None:
+        self.chat_memory.clear()
+
+MemoryType: TypeAlias = Union[
+    CustomBufferWindowMemory,
+    ConversationSummaryBufferMemory,
+    CombinedMemory
+]
 
 class MemoryStrategy(Enum):
     """Enum defining available memory strategies for conversation history management."""
@@ -192,7 +263,7 @@ class ConversationMemoryManager:
         memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=self.fallback_token_limit,
-            memory_key="chat_history",
+            memory_key="history",
             chat_memory=ChatMessageHistory(),
             return_messages=True
         )
@@ -221,24 +292,24 @@ class ConversationMemoryManager:
 
     async def _initialize_short_term_memory(
         self, history: List[MessagePair]
-    ) -> Tuple[ConversationBufferWindowMemory, MemoryStrategy]:
+    ) -> Tuple[CustomBufferWindowMemory, MemoryStrategy]:
         """Initialize short-term memory asynchronously for low token counts.
 
         Args:
             history: List of (user_content, assistant_content) tuples.
 
         Returns:
-            Tuple[ConversationBufferWindowMemory, MemoryStrategy]: Short-term memory and strategy.
+            Tuple[CustomBufferWindowMemory, MemoryStrategy]: Short-term memory and strategy.
 
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
         self.logger.info("Initializing SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT)
-        memory = ConversationBufferWindowMemory(
-            memory_key="chat_history",
-            return_messages=True,
+        memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10  # Store the last 10 messages
+            k=10,  # Store the last 10 messages
+            memory_key="history", # Explicitly set
+            return_messages=True   # Explicitly set
         )
 
         def load_messages() -> None:
@@ -268,11 +339,11 @@ class ConversationMemoryManager:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
         self.logger.info("Initializing MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
-        buffer_memory = ConversationBufferWindowMemory(
-            memory_key="buffer_history",
-            return_messages=True,
+        buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10  # Store the last 10 messages
+            k=10,  # Store the last 10 messages
+            memory_key="buffer_history", # Explicitly set
+            return_messages=True         # Explicitly set
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
@@ -320,11 +391,11 @@ class ConversationMemoryManager:
         self.logger.info("Initializing ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
 
         # Initialize memory components
-        buffer_memory = ConversationBufferWindowMemory(
-            memory_key="buffer_history",
-            return_messages=True,
+        buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10  # Store the last 10 messages
+            k=10,  # Store the last 10 messages
+            memory_key="buffer_history", # Explicitly set
+            return_messages=True         # Explicitly set
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,

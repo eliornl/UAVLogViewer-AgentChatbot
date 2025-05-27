@@ -19,11 +19,17 @@ from backend.agent_scratchpad import AgentScratchpad
 from backend.conversation_memory_manager import ConversationMemoryManager
 from backend.vector_store_manager import VectorStoreManager
 from backend.telemetry_schema import TELEMETRY_SCHEMA
+import re # Import re module
 
 logger = structlog.get_logger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Constants for tool output truncation
+MAX_TOOL_OUTPUT_ROWS: int = 50  # Max rows for query_duckdb and detect_anomalies_ml data
+MAX_TOOL_OUTPUT_ITEMS: int = 10 # Max items in the main 'data' list for analyze_stats
+MAX_LIST_ITEMS_IN_TOOL_OUTPUT: int = 5 # Max items for lists within tool output dicts (e.g., z_scores)
 
 # Constants
 MAX_MODEL_TOKENS: int = 8192  # Maximum tokens for LLM input/output
@@ -39,49 +45,85 @@ REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized
 
 Tables available (including column names in parentheses): {tables}
 
-You have access to the following tools:
-{tools}
+**Critical Instructions & Workflow:**
+
+1.  **PRIORITY ONE: Check Your Memory & Scratchpad First!**
+    *   Before doing ANYTHING else, review your **Chat History** (provided below) and your **Scratchpad** (previous analysis context: {agent_scratchpad_content}).
+    *   Chat History:
+        {chat_history}
+    *   Is the answer to the current question "{input}" already available from your previous work (in Scratchpad) or the Chat History?
+    *   **IF YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
+    *   **IF NO (or if the information is insufficient):** Then, and only then, proceed to the analysis steps below using the specified format.
+
+Now, if you determined the answer was NOT in your memory, proceed with the following:
 
 Use the following format:
 
 Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action (must be valid JSON)
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
+Thought: I need to understand the question and devise a plan. I will first determine if this is a broad anomaly/error query or a specific one.
+Action: query_duckdb (or another appropriate tool based on my plan)
+Action Input: {{...}}
+Observation: [Result of tool]
+Thought: Based on this observation, I will decide the next step.
+...
+Final Answer: the final answer to the original input question, grounded in the data obtained from tool use.
+
+**Core Instructions for Answering Questions:**
+1.  **Data-First & Tool-Driven:** Always start by using tools to get data. Conclusions MUST be based on data observed from tool outputs.
+2.  **Use `{tables}` Schema:** Consult the `{tables}` list for available tables and their exact column names. Only use existing columns.
+3.  **Verify Column Existence:** If a general strategy suggests a column, verify it exists in the `{tables}` schema for the specific table before querying it. If not, adapt your query or note its absence.
+
+**Main Analysis Strategy Decision:**
+
+*   **Is the query a broad request for "critical errors", "anomalies", "flight issues", "health check", or similar general problems?**
+    *   **YES (Broad Query):** 
+        *   Thought: The user's query is a broad request for general anomalies or errors. For this type of query, I will ONLY use the `detect_anomalies_ml` tool on a predefined list of key telemetry tables (if they exist in the current log). I will iterate through these tables, check for their existence, and if present, run `detect_anomalies_ml` on their relevant numerical columns. I will NOT use other tools or strategies from the 'Detailed Multi-Category Investigation' section for this broad query.
+        *   **Step 1: Perform ML Anomaly Detection on Predefined Key Tables.**
+            *   The predefined key tables to check with `detect_anomalies_ml` are: `telemetry_attitude`, `telemetry_global_position_int`, `telemetry_vfr_hud`, `telemetry_gps_raw_int`, `telemetry_ekf_status_report`, `telemetry_battery_status`, `telemetry_rc_channels`.
+            *   For each of these predefined tables:
+                *   Thought: I need to check if `[predefined_table_name]` exists in the current log's available `{tables}`. If it does, I will identify its numerical columns from the schema and run `detect_anomalies_ml` on them.
+                *   Action: (Conditional) If `[predefined_table_name]` is in `{tables}`: `detect_anomalies_ml` (Input: {{"db_path": "[path_to_db]", "table": "[predefined_table_name]", "columns": ["list_of_ALL_relevant_NUMERICAL_columns_from_that_table_as_per_schema"]}} )
+                *   Observation: [Results from `detect_anomalies_ml` for `[predefined_table_name]`, or note if table was not available/had no suitable numerical columns]. Note any detected anomalies.
+        *   **Step 2: Synthesize and Conclude.**
+            *   Thought: I have gathered results from `detect_anomalies_ml` for the available and applicable predefined tables. I will now synthesize these to answer the user's broad query.
+            *   Final Answer: Summarize all significant anomalies found by `detect_anomalies_ml` across the analyzed tables. If no significant issues or anomalies are found after checking the predefined tables with `detect_anomalies_ml`, state that clearly.
+
+    *   **NO (Specific Query):**
+        *   Thought: The user's query is more specific and not a general request for anomalies. I will use the "Detailed Multi-Category Investigation" below, focusing on the categories and tables most relevant to the specific question.
+
+
+**Detailed Multi-Category Investigation (for Specific Queries):**
+When the user's query is specific (e.g., "What was the battery voltage?", "Were there GPS glitches?", "Analyze roll and pitch stability"), use the following categories to guide your investigation. Focus only on what's relevant.
+
+*   **Category 1: Explicitly Logged Events & Messages**
+    *   **Goal:** Identify any system-logged errors, warnings, or critical status messages relevant to the query.
+    *   **Strategy:** Query tables like `telemetry_statustext` (if available and relevant). Look for low `severity` values or textual content suggesting problems.
+
+*   **Category 2: System & Power Health**
+    *   **Goal:** Assess system integrity relevant to the query (sensor health, power, comms).
+    *   **Strategy:** Query tables like `telemetry_sys_status` (if available and relevant). Investigate columns like `onboard_control_sensors_health`, `voltage_battery`, `current_battery`, `battery_remaining`, `load`, `drop_rate_comm`, `errors_comm`. Use `analyze_stats` for trends/outliers if needed.
+
+*   **Category 3: Navigation System Integrity (EKF, GPS, Position)**
+    *   **Goal:** Determine if the navigation system is reliable, if relevant to the query.
+    *   **Strategy:** Query `telemetry_ekf_status_report` (analyze `flags`, `variances`), `telemetry_gps_raw_int` (check `fix_type`, `satellites_visible`, `eph`, `epv`), `telemetry_global_position_int` (analyze `alt`, `relative_alt`, `vx`, `vy`, `vz`, `hdg`). Use `analyze_stats` or `detect_anomalies_ml` if detailed numerical analysis is needed for specific columns.
+
+*   **Category 4: Flight Performance & Stability Analysis**
+    *   **Goal:** Detect abnormal flight characteristics or control issues, if relevant to a specific query about performance.
+    *   **Strategy:** 
+        *   Identify the specific flight dynamics table(s) and column(s) mentioned or implied by the user's query from `{tables}` (e.g., `telemetry_attitude` for roll/pitch, `telemetry_vfr_hud` for airspeed/altitude).
+        *   Thought: I will query relevant numerical columns from the specified table(s) for analysis.
+        *   Action: `query_duckdb` (to select the specific numerical columns needed).
+        *   Observation: [Data from query]
+        *   Thought: Now I have the raw numerical data. I will use `detect_anomalies_ml` if complex unknown patterns are suspected or interpret the raw data directly if the query asks for simple statistics (e.g. min, max, or an approximate trend).
+        *   Action: (Conditional) `detect_anomalies_ml` (if appropriate for the specific query and data).
+        *   Observation: (Conditional) [Results of `detect_anomalies_ml`].
+        *   Thought: Note findings relevant to the user's specific query based on raw data and/or ML analysis.
+
+*   **Synthesize & Conclude (for Specific Queries):** After investigating relevant categories, review all observations. Formulate a final answer that directly addresses the user's specific question based on the data.
 
 IMPORTANT: When using tools, the Action Input must be valid JSON format. Examples:
-
-For query_duckdb:
-Action Input: {{"db_path": "/path/to/database.duckdb", "query": "SELECT AVG(altitude) FROM table_name"}}
-
-For analyze_stats:
-Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"], "metrics": ["mean", "std"]}}
-
-For detect_anomalies_ml:
-Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"]}}
-
-For each question:
-1. Consult the 'Tables available' list to identify relevant table(s) AND THEIR EXACT COLUMN NAMES. The format is table_name(column1, column2, ...).
-2. CRITICAL: Use ONLY the column names explicitly listed for a table in your SQL queries. DO NOT assume common names like 'timestamp' if not listed for that specific table. Verify against the list before every query.
-3. Generate a precise SQL query using the query_duckdb tool to fetch relevant data.
-4. Use the analyze_stats tool to compute statistical metrics (e.g., Z-scores, differences) for anomaly detection.
-5. Use the detect_anomalies_ml tool for unsupervised anomaly detection on numerical columns.
-6. Reason about patterns, thresholds, and inconsistencies dynamically, avoiding hardcoded rules.
-7. For high-level questions (e.g., "Are there any anomalies in this flight?"), query multiple tables, analyze key columns (e.g., roll, altitude, battery voltage), and summarize findings.
-8. Format the response clearly, explaining detected anomalies and their potential impact.
-
-Anomaly detection strategies:
-- Look for sudden changes in values (e.g., altitude drops, battery voltage decreases).
-- Identify outliers using Z-scores or machine learning (e.g., unusual roll/pitch combinations).
-- Check for inconsistencies (e.g., poor GPS fix, high EKF variances).
-- Correlate anomalies across tables (e.g., battery issues coinciding with attitude changes).
-
-If the question is ambiguous, ask for clarification and suggest possible interpretations.
-If data is missing, inform the user and suggest alternatives.
+For query_duckdb: Action Input: {{"db_path": "/path/to/database.duckdb", "query": "SELECT * FROM table_name"}}
+For detect_anomalies_ml: Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"]}}
 
 Scratchpad (previous analysis context):
 {agent_scratchpad_content}
@@ -89,7 +131,8 @@ Scratchpad (previous analysis context):
 Begin!
 
 Question: {input}
-Thought: {agent_scratchpad}"""
+Thought: {agent_scratchpad}
+"""
 
 CLARIFICATION_PHRASES: List[str] = [
     "could you clarify",
@@ -229,21 +272,41 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             logger.error("Invalid database path detected", db_path=db_path)
             return {"status": "error", "message": "Invalid database path"}
 
-        # Block dangerous SQL operations
+        # Block dangerous SQL operations using regex for whole word matching
         query_lower: str = query.lower().strip()
+        # Ensure keywords are treated as whole words and handle cases like `drop table` vs `drop_rate_comm`
         dangerous_keywords = ["drop", "delete", "update", "insert", "alter", "create", "truncate"]
-        if any(keyword in query_lower for keyword in dangerous_keywords):
-            logger.error("Potentially dangerous query detected", query=query)
-            return {"status": "error", "message": "Query contains unsupported operations"}
+        for keyword in dangerous_keywords:
+            # denotes a word boundary
+            if re.search(r"\b" + re.escape(keyword) + r"\b", query_lower):
+                logger.error("Potentially dangerous query detected due to keyword: ", query=query, keyword=keyword)
+                return {"status": "error", "message": f"Query contains prohibited keyword: {keyword}"}
         
         with duckdb.connect(db_path, read_only=True) as conn:
             result: List[tuple] = conn.execute(query).fetchall()
             columns: List[str] = [desc[0] for desc in conn.description] if conn.description else []
             
+            data_to_return = [dict(zip(columns, row)) for row in result]
+            row_count = len(data_to_return)
+
+            if row_count > MAX_TOOL_OUTPUT_ROWS:
+                logger.debug(
+                    f"query_duckdb output truncated for agent scratchpad from {row_count} to {MAX_TOOL_OUTPUT_ROWS} rows.",
+                    query=query
+                )
+                # Return a subset and a message indicating truncation
+                return {
+                    "status": "success_truncated",
+                    "data": data_to_return[:MAX_TOOL_OUTPUT_ROWS],
+                    "message": f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} rows. Original row count: {row_count}. Consider refining your query.",
+                    "row_count": row_count, # Still report original row count
+                    "displayed_row_count": MAX_TOOL_OUTPUT_ROWS
+                }
+            
             return {
                 "status": "success",
-                "data": [dict(zip(columns, row)) for row in result],
-                "row_count": len(result)
+                "data": data_to_return,
+                "row_count": row_count
             }
     except KeyError as e: # Should ideally be caught by Pydantic validation now
         logger.error(
@@ -259,154 +322,45 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
         logger.error("Unexpected error during DuckDB query execution", query=query, error_str=str(e), error_type=str(type(e)))
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
-class AnalyzeStatsInput(BaseModel):
-    db_path: str = Field(description="Path to the DuckDB database file")
-    table: str = Field(description="Name of the telemetry table")
-    columns: List[str] = Field(description="Columns to analyze")
-    metrics: List[str] = Field(description="Metrics to compute: 'z_score', 'difference', 'mean', 'std'")
-
-def analyze_stats(tool_input: Any) -> Dict[str, Any]:
-    """Compute statistical metrics for anomaly detection on telemetry data.
-
-    Args:
-        tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
-                          containing db_path, table, columns, and metrics.
-
-    Returns:
-        Dict[str, Any]: Statistical results or error details.
-            - status: 'success' or 'error'.
-            - data: List of dictionaries with metric results per column.
-            - row_count: Number of rows analyzed (if success).
-            - message: Error message (if error).
-    """
-    logger.info(
-        "analyze_stats received raw tool_input", 
-        input_type=str(type(tool_input)), 
-        input_value_snippet=str(tool_input)[:200]
-    )
-
-    args_dict: Optional[Dict[str, Any]] = None
-    if isinstance(tool_input, str):
-        try:
-            args_dict = json.loads(tool_input)
-        except json.JSONDecodeError as e:
-            logger.error("Failed to decode tool_input string as JSON", error_str=str(e), tool_input_str=tool_input)
-            return {"status": "error", "message": f"Invalid JSON input string: {str(e)}"}
-    elif isinstance(tool_input, dict):
-        args_dict = tool_input
-    else:
-        logger.error("tool_input is not a string or dict", received_type=str(type(tool_input)))
-        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
-
-    if args_dict is None: # Should not happen if logic above is correct, but as a safeguard
-        logger.error("args_dict is None after input processing, which is unexpected.")
-        return {"status": "error", "message": "Internal error: Failed to process tool input."}
-
-    try:
-        # Validate the dictionary using Pydantic. 
-        # The model_validator in AnalyzeStatsInput will handle nested JSON if necessary.
-        parsed_args = AnalyzeStatsInput.model_validate(args_dict)
-        db_path = parsed_args.db_path
-        table = parsed_args.table
-        columns = parsed_args.columns
-        metrics = parsed_args.metrics
-    except Exception as pydantic_exc: # Catch Pydantic ValidationError or other issues
-        logger.error(
-            "Pydantic validation failed for derived args_dict", 
-            args_dict_val=str(args_dict)[:500], # Log potentially large dict snippet
-            error_str=str(pydantic_exc)
-        )
-        return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
-
-    try:
-        # Prevent path traversal attacks
-        if ".." in os.path.relpath(db_path):
-            logger.error("Invalid database path detected", db_path=db_path)
-            return {"status": "error", "message": "Invalid database path"}
-
-        with duckdb.connect(db_path, read_only=True) as conn:
-            # Validate table exists
-            try:
-                conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
-            except duckdb.Error:
-                return {"status": "error", "message": f"Table '{table}' does not exist"}
-            
-            # Validate table and columns
-            try:
-                available_columns: List[str] = [col[0] for col in conn.execute(f"DESCRIBE {table}").fetchall()]
-            except duckdb.Error as e:
-                return {"status": "error", "message": f"Failed to describe table '{table}': {str(e)}"}
-            
-            valid_columns: List[str] = [col for col in columns if col in available_columns]
-            if not valid_columns:
-                return {"status": "error", "message": f"No valid columns in {table}. Available: {available_columns}, Requested: {columns}"}
-
-            # Fetch data, including timestamp if available
-            query_columns: List[str] = valid_columns.copy()
-            if 'timestamp' in available_columns and 'timestamp' not in query_columns:
-                query_columns.append('timestamp')
-            
-            query: str = f"SELECT {', '.join(query_columns)} FROM {table}"
-            df: pd.DataFrame = conn.execute(query).fetchdf()
-            
-            if df.empty:
-                return {"status": "success", "data": [], "row_count": 0}
-
-            # Compute metrics for each column
-            results: List[Dict[str, Any]] = []
-            for col in valid_columns:
-                result: Dict[str, Any] = {"column": col}
-                
-                # Check if column is numeric
-                is_numeric = pd.api.types.is_numeric_dtype(df[col])
-                result["is_numeric"] = is_numeric
-                
-                if is_numeric:
-                    col_data = df[col].dropna()  # Remove NaN values
-                    if len(col_data) == 0:
-                        result["error"] = "No valid numeric data"
-                        results.append(result)
-                        continue
-                    
-                    if 'mean' in metrics:
-                        result["mean"] = float(col_data.mean())
-                    if 'std' in metrics:
-                        result["std"] = float(col_data.std())
-                    if 'min' in metrics:
-                        result["min"] = float(col_data.min())
-                    if 'max' in metrics:
-                        result["max"] = float(col_data.max())
-                    
-                    if 'z_score' in metrics:
-                        mean_val: float = col_data.mean()
-                        std_val: float = col_data.std()
-                        if std_val > 0:
-                            z_scores = (col_data - mean_val) / std_val
-                            result["z_scores"] = z_scores.tolist()
-                            result["z_score_outliers"] = (abs(z_scores) > 3).sum()  # Count outliers
-                        else:
-                            result["z_scores"] = []
-                            result["z_score_outliers"] = 0
-                    
-                    if 'difference' in metrics:
-                        differences = col_data.diff().abs().dropna()
-                        result["differences"] = differences.tolist()
-                        result["max_difference"] = float(differences.max()) if len(differences) > 0 else 0
-                else:
-                    result["error"] = "Column is not numeric"
-                
-                results.append(result)
-
-            return {"status": "success", "data": results, "row_count": len(df)}
-
-    except Exception as e:
-        logger.error("Statistical analysis failed", table=table, error=str(e))
-        return {"status": "error", "message": f"Analysis failed: {str(e)}"}
-
 class DetectAnomaliesMLInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
     table: str = Field(description="Name of the telemetry table")
     columns: List[str] = Field(description="Numerical columns to analyze")
+
+    @model_validator(mode='before')
+    @classmethod
+    def _handle_potentially_nested_json_input(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Check for the specific nested JSON pattern for this model
+            # i.e. table and columns are missing, and db_path is a string that might be JSON
+            if ('table' not in data and 
+                'columns' not in data and 
+                'db_path' in data and 
+                isinstance(data['db_path'], str)):
+                
+                potential_json_str = data['db_path']
+                try:
+                    parsed_json = json.loads(potential_json_str)
+                    # Check if the parsed JSON has the expected keys for DetectAnomaliesMLInput
+                    if (isinstance(parsed_json, dict) and
+                        'db_path' in parsed_json and
+                        'table' in parsed_json and
+                        'columns' in parsed_json):
+                        logger.info(
+                            f"{cls.__name__}: Input data appeared to have JSON string in 'db_path'. Expanding.",
+                            original_data_keys=list(data.keys()),
+                            parsed_json_keys=list(parsed_json.keys())
+                        )
+                        return parsed_json # Return the parsed dict for Pydantic to validate
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"{cls.__name__}: 'db_path' contained a string that was not parsable " +
+                        "into the expected structure for DetectAnomaliesMLInput.",
+                        db_path_value_snippet=potential_json_str[:100]
+                    )
+                    # Fall through to return original data, Pydantic will likely raise validation error
+                    pass
+        return data
 
 def detect_anomalies_ml(tool_input: Any) -> Dict[str, Any]:
     """Detect anomalies in telemetry data using Isolation Forest.
@@ -532,11 +486,29 @@ def detect_anomalies_ml(tool_input: Any) -> Dict[str, Any]:
                 if is_anomaly:
                     anomaly_count += 1
 
+            # Truncate the results if too long
+            final_row_count = len(df_clean)
+            if len(results) > MAX_TOOL_OUTPUT_ROWS:
+                logger.warning(
+                    f"detect_anomalies_ml output truncated from {len(results)} to {MAX_TOOL_OUTPUT_ROWS} rows.",
+                    table=table
+                )
+                # Include a message about truncation in the response
+                return {
+                    "status": "success_truncated",
+                    "data": results[:MAX_TOOL_OUTPUT_ROWS],
+                    "message": f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} anomaly detection results. Original result count: {len(results)}.",
+                    "anomaly_count": (pd.Series([r['is_anomaly'] for r in results[:MAX_TOOL_OUTPUT_ROWS]])).sum(), # Recalculate anomaly_count for truncated data
+                    "row_count": final_row_count,
+                    "displayed_row_count": MAX_TOOL_OUTPUT_ROWS,
+                    "columns_used": numerical_columns
+                }
+
             return {
                 "status": "success",
                 "data": results,
                 "anomaly_count": anomaly_count,
-                "row_count": len(df_clean),
+                "row_count": final_row_count,
                 "columns_used": numerical_columns
             }
 
@@ -555,19 +527,6 @@ query_duckdb_tool: StructuredTool = StructuredTool.from_function(
         "Returns query results with status, data, and row_count."
     ),
     args_schema=QueryDuckDBInput
-)
-
-analyze_stats_tool: StructuredTool = StructuredTool.from_function(
-    func=analyze_stats,
-    name="analyze_stats",
-    description=(
-        "Compute statistical metrics on telemetry data for anomaly detection. "
-        "Parameters: db_path (string), table (string), columns (list of strings), metrics (list of strings). "
-        "Available metrics: 'mean', 'std', 'min', 'max', 'z_score', 'difference'. "
-        "Example: analyze_stats(db_path='/path/to/db.duckdb', table='telemetry_attitude', columns=['roll', 'pitch'], metrics=['mean', 'std', 'z_score']). "
-        "Use z_score to find outliers (>3 indicates anomaly), difference to find sudden changes."
-    ),
-    args_schema=AnalyzeStatsInput
 )
 
 detect_anomalies_ml_tool: StructuredTool = StructuredTool.from_function(
@@ -691,7 +650,7 @@ class TelemetryAgent:
         # Define ReAct prompt template
         self.prompt = PromptTemplate(
             template=REACT_SYSTEM_PROMPT,
-            input_variables=["input", "agent_scratchpad", "agent_scratchpad_content"],
+            input_variables=["input", "agent_scratchpad", "agent_scratchpad_content", "chat_history"],
             partial_variables={
                 "tables": tables_info,
                 "tools": "{tools}",
@@ -711,7 +670,7 @@ class TelemetryAgent:
         )
 
         # Set up ReAct agent with tools
-        tools: List[Tool] = [query_duckdb_tool, analyze_stats_tool, detect_anomalies_ml_tool]
+        tools: List[Tool] = [query_duckdb_tool, detect_anomalies_ml_tool]
 
          # Create ReAct agent
         agent = create_react_agent(
@@ -726,8 +685,9 @@ class TelemetryAgent:
             tools=tools,
             verbose=True, 
             handle_parsing_errors="Check your tool input format. It should be valid JSON with proper key-value pairs. For example: {\"db_path\": \"/path/to/file.duckdb\", \"query\": \"SELECT * FROM table\"}",
-            max_iterations=10,  # Prevent infinite loops
-            max_execution_time=120  # 2 minute timeout per execution
+            max_iterations=20,  # Prevent infinite loops (Increased from 10)
+            max_execution_time=200,  # Increased from 120s, less than CHAT_TIMEOUT_SECONDS (240s)
+            return_intermediate_steps=True # Ensure agent's thought process is returned
         )
 
     def _validate_token_limits(self) -> None:
@@ -888,180 +848,140 @@ class TelemetryAgent:
 
             # Retrieve conversation memory
             memory, memory_strategy = await self.conversation_memory_manager.aget_memory()
-            chat_history = memory.load_memory_variables({}).get("chat_history", [])
+            chat_history_messages = memory.load_memory_variables({}).get("history", [])
+            
+            # Format chat_history_messages into a string for the prompt
+            chat_history_string = ""
+            if isinstance(chat_history_messages, list):
+                for msg in chat_history_messages:
+                    if hasattr(msg, 'type') and hasattr(msg, 'content'): # LangChain BaseMessage structure
+                        chat_history_string += f"{msg.type.upper()}: {msg.content}\\n"
+                    else: # Fallback for other potential structures
+                        chat_history_string += f"{str(msg)}\\n"
+            if not chat_history_string:
+                chat_history_string = "No prior conversation history."
 
             # Identify relevant tables and hints using vector store
             search_results = await self.vector_store_manager.asimilarity_search(
                 message, k=VECTOR_RETRIEVER_K
             )
-            relevant_tables: List[str] = [
+            relevant_tables: List[str] = list(set( # Use set to ensure uniqueness
                 result.metadata.get("table", "") for result in search_results if result.metadata.get("table")
-            ]
-            anomaly_hints: List[str] = [
+            ))
+            anomaly_hints: List[str] = list(set( # Use set to ensure uniqueness
                 result.metadata.get("anomaly_hint", "") for result in search_results if result.metadata.get("anomaly_hint")
-            ]
+            ))
 
             # Prepare enhanced input with context
-            enhanced_message = f"{message}\n\nContext:\n- Relevant tables: {', '.join(relevant_tables)}\n- Anomaly detection hints: {', '.join(anomaly_hints)}\n- Database path: {self.db_path}"
+            # The prompt already has {tables} so we don't need to add relevant_tables to enhanced_message explicitly
+            # Anomaly hints are general guidance; the main prompt now emphasizes data-driven investigation.
+            enhanced_message = f"{message}\n\nContext provided by system (use for general guidance but prioritize direct data querying):\n- Anomaly detection hints related to your query: {', '.join(anomaly_hints)}\n- Database path for tools: {self.db_path}"
             
-            # Add chat history context if available
-            if chat_history:
-                history_summary = "\n- Previous conversation context available"
-                enhanced_message += history_summary
+            # The custom scratchpad content is passed separately
+            current_custom_scratchpad = self.scratchpad.to_string()
 
-            # Prepare input data for ReAct agent
-            input_data: Dict[str, str] = {
+            final_input_for_executor = {
                 "input": enhanced_message,
-                "agent_scratchpad_content": self.scratchpad.to_string()
+                "agent_scratchpad_content": current_custom_scratchpad,
+                "chat_history": chat_history_string # Pass the formatted chat history string
+                # agent_scratchpad for ReAct internal steps is handled by AgentExecutor
             }
 
-            # Execute agent chain
-            async def run_executor() -> Dict[str, Any]:
-                self.logger.debug("ReAct agent input", input_data=input_data)
-                # Ensure that the agent_scratchpad is passed correctly
-                current_scratchpad_content = self.scratchpad.to_string()
-                input_data_with_scratchpad = {
-                    "input": enhanced_message, # This already includes 'enhanced_message' from above
-                    "agent_scratchpad": current_scratchpad_content # Pass the current scratchpad content directly
-                }
-                # The REACT_SYSTEM_PROMPT template uses {agent_scratchpad} which is where LangChain injects history/intermediate steps.
-                # My manual `agent_scratchpad_content` was for the separate variable in the prompt.
-                # The actual intermediate steps are handled by AgentExecutor.
-                # So, the agent_scratchpad argument to .ainvoke should be a string representation of previous steps.
-                # This is typically handled internally by Langchain if memory is part of the agent.
-                # For ReAct, the intermediate steps are built up and passed in the 'agent_scratchpad' input variable.
-                
-                # Let's ensure the input to ainvoke is what create_react_agent expects for the {agent_scratchpad} variable.
-                # The agent_executor will fill "agent_scratchpad" with the history of thoughts and actions.
-                # My current `input_data` has "agent_scratchpad_content" for my custom prompt part,
-                # and "input" for the main question.
-                # The `create_react_agent`'s prompt has `{agent_scratchpad}` which is where it expects the sequence of
-                # Action, Action Input, Observation.
-
-                # Correct input for react agent:
-                react_input = {"input": enhanced_message, "agent_scratchpad": self.scratchpad.intermediate_steps}
-
-
-                # The AgentExecutor will internally manage the agent_scratchpad based on intermediate_steps.
-                # The input to agent_executor.ainvoke should primarily be "input".
-                # The prompt template has: Question: {input} Thought: {agent_scratchpad}
-
-                # So, the AgentExecutor expects 'input' and will populate 'agent_scratchpad'
-                # The 'agent_scratchpad_content' is my own addition for extra context.
-                
-                # Let's revert to simpler input for AgentExecutor if `scratchpad.intermediate_steps` is handled by it.
-                # The `create_react_agent` prompt expects "input" and "agent_scratchpad" (for thoughts/actions).
-                # `AgentExecutor` creates the `agent_scratchpad` string from `intermediate_steps`.
-                # My `REACT_SYSTEM_PROMPT` also includes `{agent_scratchpad_content}` which I manually populate.
-
-                # The input to `agent_executor.ainvoke` should be a dictionary containing
-                # all keys expected by the underlying agent's prompt, excluding 'agent_scratchpad'
-                # if it's internally managed, or including it if explicitly built.
-                # For `create_react_agent`, `agent_scratchpad` is the string of thoughts/actions.
-
-                final_input_for_executor = {
-                    "input": enhanced_message, # For {input} in prompt
-                    "agent_scratchpad_content": self.scratchpad.to_string() # For {agent_scratchpad_content}
-                }
-                # `agent_scratchpad` (for thought/action/observation chain) is managed by AgentExecutor
-
-                self.logger.debug("ReAct agent executor input", final_input_for_executor=final_input_for_executor)
-                result = await self.agent_executor.ainvoke(final_input_for_executor)
-
-
-                # Add intermediate steps to scratchpad
-                # This is important for the next turn if the agent is stateful across multiple calls to process_message
-                # For ReAct, the scratchpad is built per call, based on iterations.
-                # My self.scratchpad is for multi-turn context, if I were to implement that more deeply.
-                # For now, intermediate_steps from the result are key for *this* call's analysis.
-                current_call_intermediate_steps = result.get("intermediate_steps", [])
-                # self.scratchpad.add_steps(current_call_intermediate_steps) # If we want to persist across calls
-                # self.logger.debug("Added steps from current call to persistent scratchpad", steps_count=len(current_call_intermediate_steps))
-
-                return result
-
-            result: Dict[str, Any] = await asyncio.wait_for(
-                run_executor(),
+            self.logger.debug("ReAct agent executor input", final_input_for_executor_keys=list(final_input_for_executor.keys()), chat_history_snippet=chat_history_string[:200], custom_scratchpad_snippet=current_custom_scratchpad[:200])
+            
+            result = await asyncio.wait_for(
+                self.agent_executor.ainvoke(final_input_for_executor),
                 timeout=CHAT_TIMEOUT_SECONDS
             )
 
-            # Process response and check for clarification
-            response: str = result["output"]
+            # Log all keys from the agent executor result for debugging
+            self.logger.info("Full keys from AgentExecutor result", keys=list(result.keys()))
+            
+            # Populate our custom multi-turn scratchpad
+            intermediate_steps_raw = result.get("intermediate_steps", [])
+            if intermediate_steps_raw:
+                self.logger.info(f"Populating custom scratchpad with {len(intermediate_steps_raw)} steps from current turn.")
+                for agent_action_obj, observation_str in intermediate_steps_raw:
+                    # agent_action_obj is of type langchain_core.agents.AgentAction
+                    # observation_str is the string output of the tool
+                    action_details_for_scratchpad = {
+                        "tool": agent_action_obj.tool,
+                        "tool_input": agent_action_obj.tool_input,
+                        # The 'log' in AgentAction contains the thought process leading to this action.
+                        "thought_process_for_this_action": agent_action_obj.log.strip() 
+                    }
+                    self.scratchpad.add_step(action_details_for_scratchpad, str(observation_str))
+            else:
+                self.logger.warning("No intermediate_steps from AgentExecutor for this turn to add to custom scratchpad.")
+
+
+            response: str = result.get("output", "Error: No output from agent.") # Ensure there's a default
             response_lower: str = response.strip().lower()
             is_clarification: bool = (
                 response.strip().endswith("?") or
                 any(phrase in response_lower for phrase in CLARIFICATION_PHRASES)
             )
-            if is_clarification:
+            if is_clarification and not response.strip().lower().startswith("thought"): # Avoid adding to thoughts
                 self.logger.info("Response requests clarification", response=response)
                 response += "\nPlease provide more details to proceed."
 
-            # Update conversation memory
             await self.conversation_memory_manager.add_message((message, response))
 
-            # Estimate tokens for scratchpad content from the current agent run
-            # The 'agent_scratchpad' in the result is the final scratchpad string used by the agent
-            agent_internal_scratchpad_str = result.get("agent_scratchpad", "")
-            if not agent_internal_scratchpad_str and isinstance(result.get("intermediate_steps"), list):
-                # Reconstruct scratchpad string if not directly available (though usually it is for react)
-                # This is complex, assume 'agent_scratchpad' or 'intermediate_steps' is primary.
-                pass # Prefer direct 'agent_scratchpad' or 'intermediate_steps'
+            # Get intermediate steps for metadata
+            # This is crucial for debugging if the agent is taking steps
+            intermediate_steps = result.get("intermediate_steps", [])
+            if not intermediate_steps:
+                self.logger.warning("No intermediate steps were recorded by the agent for this call.", agent_output=response)
 
-            # Let's use the `self.scratchpad` which is being updated for the custom context
-            # For overall context length management, consider all inputs to the LLM.
-            scratchpad_for_token_check = self.scratchpad.to_string() # Custom scratchpad
-            scratchpad_tokens = len(self.token_encoder.encode(scratchpad_for_token_check))
 
-            if scratchpad_tokens > self.max_context_tokens // 2:
+            # Sanitize intermediate_steps for logging in metadata
+            logged_intermediate_steps_for_metadata = []
+            for action, observation in intermediate_steps_raw: # Use intermediate_steps_raw here
+                logged_observation_str = str(observation)
+                if len(logged_observation_str) > 500: # Arbitrary limit for logging
+                    logged_observation_str = logged_observation_str[:500] + " ... (truncated in log)"
+                
+                # action is an AgentAction object. Access its attributes.
+                tool_name = action.tool if hasattr(action, 'tool') else 'UnknownTool'
+                tool_input_val = action.tool_input if hasattr(action, 'tool_input') else 'UnknownInput'
+                
+                logged_intermediate_steps_for_metadata.append(
+                    (f"Tool: {tool_name}, Input: {tool_input_val}", logged_observation_str)
+                )
+
+            metadata: Dict[str, Any] = {
+                "relevant_tables": relevant_tables, # These are from vector search, not agent's direct use confirmation
+                "anomaly_hints": anomaly_hints,
+                "intermediate_steps": logged_intermediate_steps_for_metadata, # Use the correctly formatted one 
+                "token_usage": self.token_callback.token_usage,
+                "memory_strategy": memory_strategy.value,
+                "is_clarification": is_clarification,
+                "agent_scratchpad_custom_context": current_custom_scratchpad, 
+                "agent_internal_scratchpad_final": result.get("agent_scratchpad", "") or result.get("log", ""), # ReAct often uses 'log'
+                "agent_type": "react",
+                "raw_agent_output": result.get("output", "") # Add raw output for easier debugging
+            }
+            
+            # Manage custom scratchpad size (Token check was here, keep it)
+            scratchpad_tokens = len(self.token_encoder.encode(current_custom_scratchpad))
+            if scratchpad_tokens > self.max_context_tokens // 2: # type: ignore
                 self.logger.warning(
                     "Custom scratchpad content approaching token limit",
                     tokens=scratchpad_tokens,
                     max_context_tokens=self.max_context_tokens
                 )
-                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:] # Truncate custom
+                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:] 
                 self.logger.info("Truncated custom scratchpad to last 10 steps to manage token limit")
 
-            # Sanitize intermediate_steps for logging to remove time_boot_ms from query_duckdb data
-            raw_intermediate_steps = result.get("intermediate_steps", [])
-            logged_intermediate_steps = []
-            for action, observation in raw_intermediate_steps:
-                if (action.tool == "query_duckdb" and
-                        isinstance(observation, dict) and
-                        observation.get("status") == "success" and
-                        isinstance(observation.get("data"), list)):
-                    
-                    new_observation_data = []
-                    for item in observation["data"]:
-                        if isinstance(item, dict):
-                            logged_item = item.copy()
-                            logged_item.pop('time_boot_ms', None)
-                            new_observation_data.append(logged_item)
-                        else:
-                            new_observation_data.append(item) # Should not happen with current query_duckdb
-                    
-                    logged_observation = observation.copy()
-                    logged_observation["data"] = new_observation_data
-                    logged_intermediate_steps.append((action, logged_observation))
-                else:
-                    logged_intermediate_steps.append((action, observation))
-            
-            # Compile metadata
-            metadata: Dict[str, Any] = {
-                "relevant_tables": relevant_tables,
-                "anomaly_hints": anomaly_hints,
-                "intermediate_steps": logged_intermediate_steps, # Use sanitized version for logging
-                "token_usage": self.token_callback.token_usage,
-                "memory_strategy": memory_strategy.value,
-                "is_clarification": is_clarification,
-                "agent_scratchpad_custom_context": self.scratchpad.to_string(), # Log the custom context scratchpad
-                "agent_internal_scratchpad_final": agent_internal_scratchpad_str, # Log agent's final scratchpad string
-                "agent_type": "react"
-            }
 
             self.logger.info(
                 "Generated response",
                 response_length=len(response),
-                metadata=metadata
+                # Full metadata can be very verbose if intermediate steps are complex.
+                # Consider logging only key parts or a summary of metadata here.
+                metadata_intermediate_steps_count=len(logged_intermediate_steps_for_metadata),
+                metadata_token_usage=metadata["token_usage"],
+                metadata_is_clarification=metadata["is_clarification"]
             )
             return response, metadata
 
@@ -1076,6 +996,7 @@ class TelemetryAgent:
             self.logger.error(
                 "Failed to process message",
                 message=message,
-                error=str(e)
+                error_str=str(e), # Use error_str for consistency with other logs
+                error_type=str(type(e))
             )
-            raise ValueError(f"Failed to process message: {str(e)}") from e
+            raise # Re-raise the caught exception
