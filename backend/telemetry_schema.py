@@ -1,7 +1,36 @@
-from typing import List, Dict, Any, TypedDict, Literal
+"""Telemetry schema definitions for the UAV Log Viewer application.
+
+This module defines the structure of telemetry data tables used in the application,
+including column definitions, data types, descriptions, and example data. It also
+provides validation functions to ensure the schema is correctly formatted.
+
+The schema is used for:
+1. Creating database tables in DuckDB
+2. Generating vector embeddings for semantic search
+3. Providing context for anomaly detection
+4. Supporting the telemetry agent's understanding of data structure
+"""
+
+from typing import List, Dict, Any, TypedDict, Literal, Set
 import structlog
 
+# Configure logger
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+# Constants for schema validation
+REQUIRED_TABLE_FIELDS: List[str] = ["table", "columns", "description", "anomaly_hint", "example"]
+REQUIRED_COLUMN_FIELDS: List[str] = ["name", "data_type", "description", "nullable"]
+ALLOWED_DATA_TYPES: Set[str] = {"int", "float", "str", "list[int]"}
+
+# Error message templates
+MISSING_FIELDS_ERROR: str = "Missing required fields {fields} in telemetry schema for table {table}"
+EMPTY_ANOMALY_HINT_ERROR: str = "Invalid or empty anomaly_hint for table {table}"
+NO_COLUMNS_ERROR: str = "No columns defined for table {table}"
+COLUMN_MISMATCH_ERROR: str = "Example for {table} does not match columns"
+MISSING_COLUMN_FIELDS_ERROR: str = "Missing required column fields for {table}.{column}"
+INVALID_DATA_TYPE_ERROR: str = "Invalid data type {data_type} for {table}.{column}"
+INVALID_NULLABLE_ERROR: str = "Invalid nullable field for {table}.{column}"
+INVALID_EXAMPLE_TYPE_ERROR: str = "Invalid example value type for {table}.{column}: expected {expected}"
 
 # Define type aliases for clarity
 ColumnDataType = Literal["int", "float", "str", "list[int]"]
@@ -251,7 +280,8 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
     """Validate the structure and content of telemetry schema.
 
     Ensures that each table entry has required fields, valid column metadata,
-    and consistent example data matching the column definitions.
+    and consistent example data matching the column definitions. This validation
+    is performed at module load time to catch any schema issues early.
 
     Args:
         metadata: List of table metadata dictionaries to validate.
@@ -259,25 +289,32 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
     Raises:
         ValueError: If any metadata entry or column is invalid, or if example data
             does not match column definitions.
+            
+    Example:
+        >>> validate_telemetry_schema(TELEMETRY_SCHEMA)
+        # No return value if validation passes
     """
-    allowed_data_types: set[ColumnDataType] = {"int", "float", "str", "list[int]"}
-    
     for meta in metadata:
         # Validate required fields
         table_name: str = meta.get("table", "")
-        if not all(key in meta for key in ["table", "columns", "description", "anomaly_hint", "example"]):
-            logger.error("Missing required fields in telemetry schema", table=table_name)
-            raise ValueError(f"Missing required fields in telemetry schema for table {table_name}")
+        if not all(key in meta for key in REQUIRED_TABLE_FIELDS):
+            missing_fields = set(REQUIRED_TABLE_FIELDS) - set(meta.keys())
+            logger.error(
+                "Missing required fields in telemetry schema", 
+                table=table_name,
+                missing_fields=missing_fields
+            )
+            raise ValueError(MISSING_FIELDS_ERROR.format(fields=missing_fields, table=table_name))
         
         # Validate anomaly_hint
         if not isinstance(meta["anomaly_hint"], str) or not meta["anomaly_hint"].strip():
             logger.error("Invalid or empty anomaly_hint", table=table_name)
-            raise ValueError(f"Invalid or empty anomaly_hint for table {table_name}")
+            raise ValueError(EMPTY_ANOMALY_HINT_ERROR.format(table=table_name))
         
         # Validate columns
         if not meta["columns"]:
             logger.error("No columns defined", table=table_name)
-            raise ValueError(f"No columns defined for table {table_name}")
+            raise ValueError(NO_COLUMNS_ERROR.format(table=table_name))
             
         # Validate example matches columns
         column_names: set[str] = {col["name"] for col in meta["columns"]}
@@ -289,25 +326,36 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                 missing_columns=column_names - example_keys,
                 extra_columns=example_keys - column_names
             )
-            raise ValueError(f"Example for {table_name} does not match columns")
+            raise ValueError(COLUMN_MISMATCH_ERROR.format(table=table_name))
 
         # Validate each column
         for col in meta["columns"]:
             col_name: str = col.get("name", "")
             # Check required column fields
-            if not all(key in col for key in ["name", "data_type", "description", "nullable"]):
-                logger.error("Missing required column fields", table=table_name, column=col_name)
-                raise ValueError(f"Missing required column fields for {table_name}.{col_name}")
+            if not all(key in col for key in REQUIRED_COLUMN_FIELDS):
+                missing_fields = set(REQUIRED_COLUMN_FIELDS) - set(col.keys())
+                logger.error(
+                    "Missing required column fields", 
+                    table=table_name, 
+                    column=col_name,
+                    missing_fields=missing_fields
+                )
+                raise ValueError(MISSING_COLUMN_FIELDS_ERROR.format(table=table_name, column=col_name))
 
             # Validate data type
-            if col["data_type"] not in allowed_data_types:
+            if col["data_type"] not in ALLOWED_DATA_TYPES:
                 logger.error(
                     "Invalid data type in column metadata",
                     table=table_name,
                     column=col_name,
-                    data_type=col["data_type"]
+                    data_type=col["data_type"],
+                    allowed_types=list(ALLOWED_DATA_TYPES)
                 )
-                raise ValueError(f"Invalid data type {col['data_type']} for {table_name}.{col_name}")
+                raise ValueError(INVALID_DATA_TYPE_ERROR.format(
+                    data_type=col["data_type"],
+                    table=table_name,
+                    column=col_name
+                ))
 
             # Validate nullable field
             if not isinstance(col["nullable"], bool):
@@ -315,9 +363,13 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                     "Invalid nullable field",
                     table=table_name,
                     column=col_name,
-                    nullable=col["nullable"]
+                    nullable=col["nullable"],
+                    expected_type="bool"
                 )
-                raise ValueError(f"Invalid nullable field for {table_name}.{col_name}")
+                raise ValueError(INVALID_NULLABLE_ERROR.format(
+                    table=table_name,
+                    column=col_name
+                ))
 
             # Validate example value type
             example_value: Any = meta["example"][col_name]
@@ -332,7 +384,11 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                     expected="int",
                     got=type(example_value).__name__
                 )
-                raise ValueError(f"Invalid example value type for {table_name}.{col_name}: expected int")
+                raise ValueError(INVALID_EXAMPLE_TYPE_ERROR.format(
+                    table=table_name,
+                    column=col_name,
+                    expected="int"
+                ))
             if col["data_type"] == "float" and not isinstance(example_value, float):
                 logger.error(
                     "Invalid example value type",
@@ -341,7 +397,11 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                     expected="float",
                     got=type(example_value).__name__
                 )
-                raise ValueError(f"Invalid example value type for {table_name}.{col_name}: expected float")
+                raise ValueError(INVALID_EXAMPLE_TYPE_ERROR.format(
+                    table=table_name,
+                    column=col_name,
+                    expected="float"
+                ))
             if col["data_type"] == "str" and not isinstance(example_value, str):
                 logger.error(
                     "Invalid example value type",
@@ -350,7 +410,11 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                     expected="str",
                     got=type(example_value).__name__
                 )
-                raise ValueError(f"Invalid example value type for {table_name}.{col_name}: expected str")
+                raise ValueError(INVALID_EXAMPLE_TYPE_ERROR.format(
+                    table=table_name,
+                    column=col_name,
+                    expected="str"
+                ))
             if col["data_type"] == "list[int]" and not (
                 isinstance(example_value, list) and all(isinstance(x, int) for x in example_value)
             ):
@@ -361,7 +425,11 @@ def validate_telemetry_schema(metadata: List[TableMetadata]) -> None:
                     expected="list[int]",
                     got=type(example_value).__name__
                 )
-                raise ValueError(f"Invalid example value type for {table_name}.{col_name}: expected list[int]")
+                raise ValueError(INVALID_EXAMPLE_TYPE_ERROR.format(
+                    table=table_name,
+                    column=col_name,
+                    expected="list[int]"
+                ))
 
 # Validate schema at module load
 validate_telemetry_schema(TELEMETRY_SCHEMA)

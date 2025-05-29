@@ -1,45 +1,80 @@
+"""Telemetry Agent module for UAV Log Viewer application.
+
+This module implements an intelligent agent for analyzing UAV telemetry data,
+detecting flight anomalies, and answering user queries about flight data. It uses
+LangChain's ReAct agent framework with custom tools for SQL querying and anomaly
+detection, along with memory management for multi-turn conversations.
+
+The agent can process natural language queries about telemetry data, execute
+appropriate SQL queries or anomaly detection algorithms, and provide insights
+about flight performance, system status, and potential issues.
+"""
+
 from typing import Dict, Any, Optional, List, Tuple
 import os
-from pydantic import BaseModel, Field, model_validator
+import time
+from pydantic import BaseModel, Field, model_validator, ValidationError
 import structlog
 import asyncio
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import IsolationForest
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import Tool, StructuredTool
-from langchain.agents import create_openai_tools_agent, AgentExecutor, create_react_agent
+from langchain.agents import AgentExecutor, create_react_agent
 from langchain.callbacks.base import BaseCallbackHandler
-from langchain_core.runnables import RunnableLambda
 import duckdb
 import json
 from backend.agent_scratchpad import AgentScratchpad
 from backend.conversation_memory_manager import ConversationMemoryManager
 from backend.vector_store_manager import VectorStoreManager
 from backend.telemetry_schema import TELEMETRY_SCHEMA
-import re # Import re module
+from backend.anomaly_detector import AnomalyDetector
+import re
 
 logger = structlog.get_logger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Constants for tool output truncation
-MAX_TOOL_OUTPUT_ROWS: int = 50  # Max rows for query_duckdb and detect_anomalies_ml data
-MAX_TOOL_OUTPUT_ITEMS: int = 10 # Max items in the main 'data' list for analyze_stats
-MAX_LIST_ITEMS_IN_TOOL_OUTPUT: int = 5 # Max items for lists within tool output dicts (e.g., z_scores)
-
-# Constants
-MAX_MODEL_TOKENS: int = 8192  # Maximum tokens for LLM input/output
+# Token management constants
+MAX_MODEL_TOKENS: int = 8192         # Maximum tokens for LLM input/output
 RESERVED_RESPONSE_TOKENS: int = 1024  # Tokens reserved for LLM response
 MAX_TOKEN_SAFETY_LIMIT: int = 16384  # Absolute token limit for safety
-FALLBACK_TOKEN_FACTOR: int = 2  # Factor to reduce context tokens if needed
-LLM_TEMPERATURE: float = 0.0  # LLM temperature for deterministic responses
-VECTOR_RETRIEVER_K: int = 4  # Number of vector store search results
-QUERY_TIMEOUT_SECONDS: float = 30.0  # Timeout for DuckDB queries
-CHAT_TIMEOUT_SECONDS: float = 60.0  # Timeout for agent processing, including ML
+FALLBACK_TOKEN_FACTOR: int = 2        # Factor to reduce context tokens if needed
+
+# LLM configuration constants
+LLM_TEMPERATURE: float = 0.0          # LLM temperature for deterministic responses
+VECTOR_RETRIEVER_K: int = 4           # Number of vector store search results
+
+# Timeout constants
+QUERY_TIMEOUT_SECONDS: float = 30.0   # Timeout for DuckDB queries
+CHAT_TIMEOUT_SECONDS: float = 60.0    # Timeout for agent processing, including ML
+
+# Output formatting constants
+MAX_TOOL_OUTPUT_ROWS: int = 50        # Max rows for query_duckdb and detect_anomalies output
+
+# Error message constants
+ERROR_EMPTY_MESSAGE: str = "Empty message provided, skipping processing"
+ERROR_AGENT_NOT_INITIALIZED: str = "Agent executor is not initialized. Call async_initialize() first."
+ERROR_MEMORY_NOT_INITIALIZED: str = "Conversation memory manager is not initialized. Call async_initialize() first."
+ERROR_TOKEN_CALLBACK_NOT_INITIALIZED: str = "Token callback is not initialized. Call async_initialize() first."
+ERROR_INVALID_MAX_TOKENS: str = "Invalid max_tokens: {} must be positive"
+ERROR_MAX_TOKENS_EXCEEDS_LIMIT: str = "max_tokens {} exceeds safety limit {}"
+ERROR_MAX_TOKENS_TOO_SMALL: str = "max_tokens {} must be greater than RESERVED_RESPONSE_TOKENS {}"
+ERROR_PROCESSING_TIMEOUT: str = "Message processing timed out after {} seconds"
+ERROR_SCRATCHPAD_TOKEN_LIMIT: str = "Custom scratchpad content approaching token limit"
+
+# Clarification detection phrases
+CLARIFICATION_PHRASES: List[str] = [
+    "could you clarify",
+    "can you clarify",
+    "can you specify",
+    "what do you mean",
+    "please clarify",
+    "could you specify",
+    "more details needed",
+    "can you provide more"
+]
 
 REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized in detecting flight anomalies in MAVLink data. 
 
@@ -77,16 +112,15 @@ Final Answer: the final answer to the original input question, grounded in the d
 
 *   **Is the query a broad request for "critical errors", "anomalies", "flight issues", "health check", or similar general problems?**
     *   **YES (Broad Query):** 
-        *   Thought: The user's query is a broad request for general anomalies or errors. For this type of query, I will ONLY use the `detect_anomalies_ml` tool on a predefined list of key telemetry tables (if they exist in the current log). I will iterate through these tables, check for their existence, and if present, run `detect_anomalies_ml` on their relevant numerical columns. I will NOT use other tools or strategies from the 'Detailed Multi-Category Investigation' section for this broad query.
-        *   **Step 1: Perform ML Anomaly Detection on Predefined Key Tables.**
-            *   The predefined key tables to check with `detect_anomalies_ml` are: `telemetry_attitude`, `telemetry_global_position_int`, `telemetry_vfr_hud`, `telemetry_gps_raw_int`, `telemetry_ekf_status_report`, `telemetry_battery_status`, `telemetry_rc_channels`.
-            *   For each of these predefined tables:
-                *   Thought: I need to check if `[predefined_table_name]` exists in the current log's available `{tables}`. If it does, I will identify its numerical columns from the schema and run `detect_anomalies_ml` on them.
-                *   Action: (Conditional) If `[predefined_table_name]` is in `{tables}`: `detect_anomalies_ml` (Input: {{"db_path": "[path_to_db]", "table": "[predefined_table_name]", "columns": ["list_of_ALL_relevant_NUMERICAL_columns_from_that_table_as_per_schema"]}} )
-                *   Observation: [Results from `detect_anomalies_ml` for `[predefined_table_name]`, or note if table was not available/had no suitable numerical columns]. Note any detected anomalies.
+        *   Thought: The user's query is a broad request for general anomalies or errors. For this type of query, I will use the `detect_anomalies` tool which comprehensively analyzes all data in the most relevant tables.
+        *   **Step 1: Use Anomaly Detection.**
+            *   Action: `detect_anomalies` (Input: {{"db_path": "[path_to_db]"}} )
+            *   Observation: [Results from `detect_anomalies` showing tables processed and anomalies found across all tables]
         *   **Step 2: Synthesize and Conclude.**
-            *   Thought: I have gathered results from `detect_anomalies_ml` for the available and applicable predefined tables. I will now synthesize these to answer the user's broad query.
-            *   Final Answer: Summarize all significant anomalies found by `detect_anomalies_ml` across the analyzed tables. If no significant issues or anomalies are found after checking the predefined tables with `detect_anomalies_ml`, state that clearly.
+            *   Thought: I have received comprehensive anomaly detection results across the most important tables. These results include analysis of all available data and are highly reliable.
+            *   Final Answer: Summarize all significant anomalies found across the analyzed tables. If no significant issues or anomalies are found, state that clearly.
+            
+        *   **IMPORTANT: Trust the model results completely.** The anomaly detection model has been trained on all available data and focuses on the most relevant tables where anomalies are likely to occur. DO NOT perform additional queries to verify the model's findings. The model's results are sufficient and comprehensive.
 
     *   **NO (Specific Query):**
         *   Thought: The user's query is more specific and not a general request for anomalies. I will use the "Detailed Multi-Category Investigation" below, focusing on the categories and tables most relevant to the specific question.
@@ -123,7 +157,7 @@ When the user's query is specific (e.g., "What was the battery voltage?", "Were 
 
 IMPORTANT: When using tools, the Action Input must be valid JSON format. Examples:
 For query_duckdb: Action Input: {{"db_path": "/path/to/database.duckdb", "query": "SELECT * FROM table_name"}}
-For detect_anomalies_ml: Action Input: {{"db_path": "/path/to/database.duckdb", "table": "table_name", "columns": ["col1", "col2"]}}
+For detect_anomalies: Action Input: {{"db_path": "/path/to/database.duckdb"}} or {{"db_path": "/path/to/database.duckdb", "tables": ["table1", "table2"]}}
 
 Scratchpad (previous analysis context):
 {agent_scratchpad_content}
@@ -288,21 +322,8 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             
             data_to_return = [dict(zip(columns, row)) for row in result]
             row_count = len(data_to_return)
-
-            if row_count > MAX_TOOL_OUTPUT_ROWS:
-                logger.debug(
-                    f"query_duckdb output truncated for agent scratchpad from {row_count} to {MAX_TOOL_OUTPUT_ROWS} rows.",
-                    query=query
-                )
-                # Return a subset and a message indicating truncation
-                return {
-                    "status": "success_truncated",
-                    "data": data_to_return[:MAX_TOOL_OUTPUT_ROWS],
-                    "message": f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} rows. Original row count: {row_count}. Consider refining your query.",
-                    "row_count": row_count, # Still report original row count
-                    "displayed_row_count": MAX_TOOL_OUTPUT_ROWS
-                }
             
+            # Return all results without truncation
             return {
                 "status": "success",
                 "data": data_to_return,
@@ -326,10 +347,14 @@ class DetectAnomaliesMLInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
     table: str = Field(description="Name of the telemetry table")
     columns: List[str] = Field(description="Numerical columns to analyze")
+    
+class DetectAnomaliesBatchInput(BaseModel):
+    db_path: str = Field(description="Path to the DuckDB database file")
+    tables: Optional[List[str]] = Field(default=None, description="List of tables to analyze. If None, will use priority tables")
 
     @model_validator(mode='before')
     @classmethod
-    def _handle_potentially_nested_json_input(cls, data: Any) -> Any:
+    def check_values(cls, data: Any) -> Any:
         if isinstance(data, dict):
             # Check for the specific nested JSON pattern for this model
             # i.e. table and columns are missing, and db_path is a string that might be JSON
@@ -362,159 +387,123 @@ class DetectAnomaliesMLInput(BaseModel):
                     pass
         return data
 
-def detect_anomalies_ml(tool_input: Any) -> Dict[str, Any]:
-    """Detect anomalies in telemetry data using Isolation Forest.
+# Global instance of AnomalyDetector for the anomaly detection functions
+anomalies_detector_instance: Dict[str, Optional[AnomalyDetector]] = {"instance": None}
 
+def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
+    """Detect anomalies across multiple tables efficiently.
+    
+    This function processes the most important tables where anomalies are likely to occur,
+    analyzing all available data for comprehensive anomaly detection. It's ideal for
+    broad queries about anomalies across the entire dataset.
+    
     Args:
         tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
-                          containing db_path, table, and columns.
-
+                          containing db_path and optionally tables.
+                          
     Returns:
-        Dict[str, Any]: Anomaly detection results or error details.
-            - status: 'success' or 'error'.
-            - data: List of dictionaries with row indices and anomaly flags (True for anomalies).
-            - anomaly_count: Number of anomalies detected.
-            - row_count: Number of rows analyzed (if success).
-            - message: Error message (if error).
+        Dict[str, Any]: Combined anomaly detection results across multiple tables.
+            - status: 'success', 'partial_success', or 'error'.
+            - tables_processed: List of tables successfully analyzed.
+            - tables_skipped: List of tables that were skipped.
+            - anomalies_found: Total number of anomalies found across all tables.
+            - results: Dictionary mapping table names to their individual results.
     """
-    logger.info(
-        "detect_anomalies_ml received raw tool_input", 
-        input_type=str(type(tool_input)), 
-        input_value_snippet=str(tool_input)[:200]
-    )
-
+    logger.info("detect_anomalies received request", input_type=str(type(tool_input)))
+    start_time = time.time()
+    
     args_dict: Optional[Dict[str, Any]] = None
     if isinstance(tool_input, str):
         try:
-            args_dict = json.loads(tool_input)
+            # Try to clean up the input if it contains multiple JSON objects
+            if tool_input.count('{') > 1 and tool_input.count('}') > 1:
+                # Find the first complete JSON object
+                first_open = tool_input.find('{')
+                first_close = tool_input.find('}')
+                if first_open >= 0 and first_close > first_open:
+                    # Extract just the first JSON object
+                    clean_input = tool_input[first_open:first_close+1]
+                    logger.warning(f"Detected multiple JSON objects in input, using only the first one: {clean_input}")
+                    try:
+                        args_dict = json.loads(clean_input)
+                    except json.JSONDecodeError:
+                        # If that fails, try the original input
+                        args_dict = json.loads(tool_input)
+                else:
+                    args_dict = json.loads(tool_input)
+            else:
+                args_dict = json.loads(tool_input)
         except json.JSONDecodeError as e:
-            logger.error("Failed to decode tool_input string as JSON", error_str=str(e), tool_input_str=tool_input)
+            logger.error("Failed to decode tool_input string as JSON", error_str=str(e))
             return {"status": "error", "message": f"Invalid JSON input string: {str(e)}"}
     elif isinstance(tool_input, dict):
         args_dict = tool_input
     else:
         logger.error("tool_input is not a string or dict", received_type=str(type(tool_input)))
         return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
-
-    if args_dict is None: # Should not happen if logic above is correct, but as a safeguard
+    
+    if args_dict is None:
         logger.error("args_dict is None after input processing, which is unexpected.")
         return {"status": "error", "message": "Internal error: Failed to process tool input."}
-
+    
     try:
-        # Validate the dictionary using Pydantic. 
-        # The model_validator in DetectAnomaliesMLInput will handle nested JSON if necessary.
-        parsed_args = DetectAnomaliesMLInput.model_validate(args_dict)
-        db_path = parsed_args.db_path
-        table = parsed_args.table
-        columns = parsed_args.columns
-    except Exception as pydantic_exc: # Catch Pydantic ValidationError or other issues
-        logger.error(
-            "Pydantic validation failed for derived args_dict", 
-            args_dict_val=str(args_dict)[:500], # Log potentially large dict snippet
-            error_str=str(pydantic_exc)
+        # Validate the dictionary using Pydantic
+        parsed_args = DetectAnomaliesBatchInput.model_validate(args_dict)
+        
+        # Get or create the global anomaly detector instance
+        global anomalies_detector_instance
+        detector = anomalies_detector_instance["instance"]
+        if detector is None or detector.db_path != parsed_args.db_path:
+            detector = AnomalyDetector(parsed_args.db_path)
+            anomalies_detector_instance["instance"] = detector
+            # Initialize the detector (loads schemas, starts background model training)
+            # Run in a new event loop since this is now a synchronous function
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(detector.initialize())
+            finally:
+                loop.close()
+        
+        # Run batch detection with a time limit
+        # Run in a new event loop since this is now a synchronous function
+        loop = asyncio.new_event_loop()
+        try:
+            result = loop.run_until_complete(detector.detect_anomalies_batch(  # Using the batch method internally
+                tables=parsed_args.tables,
+                max_rows_per_table=0,  # 0 means use all available data
+                time_limit_seconds=45.0   # Leave buffer for the 60s timeout
+            ))
+        finally:
+            loop.close()
+        
+        # Truncate results to avoid excessive token usage
+        if "results" in result:
+            for table_name, table_result in result["results"].items():
+                if "data" in table_result and len(table_result["data"]) > MAX_TOOL_OUTPUT_ROWS:
+                    table_result["data"] = table_result["data"][:MAX_TOOL_OUTPUT_ROWS]
+                    table_result["displayed_row_count"] = MAX_TOOL_OUTPUT_ROWS
+                    table_result["message"] = f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} anomaly detection results. Original result count: {table_result.get('row_count', 0)}."
+        
+        logger.info(
+            "detect_anomalies completed", 
+            time_taken=time.time() - start_time,
+            tables_processed=len(result.get("tables_processed", [])),
+            tables_skipped=len(result.get("tables_skipped", [])),
+            anomalies_found=result.get("anomalies_found", 0)
         )
-        return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
-
-    try:
-        # Prevent path traversal attacks
-        if ".." in os.path.relpath(db_path):
-            logger.error("Invalid database path detected", db_path=db_path)
-            return {"status": "error", "message": "Invalid database path"}
-
-        with duckdb.connect(db_path, read_only=True) as conn:
-            # Validate table exists
-            try:
-                conn.execute(f"SELECT 1 FROM {table} LIMIT 1")
-            except duckdb.Error:
-                return {"status": "error", "message": f"Table '{table}' does not exist"}
-            
-            # Get available columns
-            try:
-                available_columns: List[str] = [col[0] for col in conn.execute(f"DESCRIBE {table}").fetchall()]
-            except duckdb.Error as e:
-                return {"status": "error", "message": f"Failed to describe table '{table}': {str(e)}"}
-            
-            # Filter for valid columns that exist in the table
-            valid_columns: List[str] = [col for col in columns if col in available_columns]
-            if not valid_columns:
-                return {"status": "error", "message": f"No valid columns in {table}. Available: {available_columns}, Requested: {columns}"}
-
-            # Fetch data
-            query: str = f"SELECT {', '.join(valid_columns)} FROM {table}"
-            df: pd.DataFrame = conn.execute(query).fetchdf()
-            
-            if df.empty:
-                return {"status": "success", "data": [], "anomaly_count": 0, "row_count": 0}
-
-            # Filter for numerical columns only
-            numerical_columns = []
-            for col in valid_columns:
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    numerical_columns.append(col)
-            
-            if not numerical_columns:
-                return {"status": "error", "message": f"No numerical columns found. Available columns: {valid_columns}"}
-
-            # Remove rows with NaN values in the selected columns
-            df_clean = df[numerical_columns].dropna()
-            if df_clean.empty:
-                return {"status": "error", "message": "No valid data after removing NaN values"}
-
-            # Fit Isolation Forest model
-            model: IsolationForest = IsolationForest(
-                contamination=0.1,  # Expect 10% anomalies
-                random_state=42,
-                n_estimators=100
-            )
-            predictions: np.ndarray = model.fit_predict(df_clean)
-            anomaly_scores: np.ndarray = model.decision_function(df_clean)
-            
-            # -1 indicates anomaly, 1 indicates normal
-            anomalies: np.ndarray = predictions == -1
-            
-            # Format results - map back to original dataframe indices
-            results: List[Dict[str, Any]] = []
-            anomaly_count = 0
-            
-            for i, (idx, is_anomaly) in enumerate(zip(df_clean.index, anomalies)):
-                result = {
-                    "row_index": int(idx),  # Original dataframe index
-                    "is_anomaly": bool(is_anomaly),
-                    "anomaly_score": float(anomaly_scores[i])
-                }
-                results.append(result)
-                if is_anomaly:
-                    anomaly_count += 1
-
-            # Truncate the results if too long
-            final_row_count = len(df_clean)
-            if len(results) > MAX_TOOL_OUTPUT_ROWS:
-                logger.warning(
-                    f"detect_anomalies_ml output truncated from {len(results)} to {MAX_TOOL_OUTPUT_ROWS} rows.",
-                    table=table
-                )
-                # Include a message about truncation in the response
-                return {
-                    "status": "success_truncated",
-                    "data": results[:MAX_TOOL_OUTPUT_ROWS],
-                    "message": f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} anomaly detection results. Original result count: {len(results)}.",
-                    "anomaly_count": (pd.Series([r['is_anomaly'] for r in results[:MAX_TOOL_OUTPUT_ROWS]])).sum(), # Recalculate anomaly_count for truncated data
-                    "row_count": final_row_count,
-                    "displayed_row_count": MAX_TOOL_OUTPUT_ROWS,
-                    "columns_used": numerical_columns
-                }
-
-            return {
-                "status": "success",
-                "data": results,
-                "anomaly_count": anomaly_count,
-                "row_count": final_row_count,
-                "columns_used": numerical_columns
-            }
-
+        return result
+        
+    except ValidationError as e:
+        logger.error("Validation error in detect_anomalies", error=str(e))
+        return {"status": "error", "message": f"Invalid input: {str(e)}"}
     except Exception as e:
-        logger.error("ML anomaly detection failed", table=table, error=str(e))
-        return {"status": "error", "message": f"Detection failed: {str(e)}"}
+        logger.error("Error in detect_anomalies", error=str(e), exc_info=True)
+        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
+# The detect_anomalies_ml function has been removed as it's been replaced by the more efficient detect_anomalies function
+
+# The _fast_statistical_anomaly_detection function has been removed as it was only used by the detect_anomalies_ml function
+
 
 # Register tools for LangChain - all functions are now synchronous
 query_duckdb_tool: StructuredTool = StructuredTool.from_function(
@@ -524,21 +513,35 @@ query_duckdb_tool: StructuredTool = StructuredTool.from_function(
         "Execute a SQL query on a DuckDB database. Use this to fetch telemetry data. "
         "Parameters: db_path (string, path to database), query (string, SQL query). "
         "Example: query_duckdb(db_path='/path/to/db.duckdb', query='SELECT AVG(altitude) FROM telemetry_global_position'). "
-        "Returns query results with status, data, and row_count."
+        "Returns query results with status, data, and row_count. "
+        "\n\nWhen discussing query results, always provide context about tables and columns: "
+        "\n- When mentioning a specific table (e.g., 'telemetry_attitude'), explain what kind of data this table contains (e.g., 'the telemetry_attitude table contains vehicle orientation data including roll, pitch, and yaw angles'). "
+        "\n- When mentioning specific columns (e.g., 'roll'), explain what this column represents and its unit of measurement (e.g., 'the roll column represents the aircraft's roll angle measured in degrees'). "
+        "\n- For numerical values, include appropriate units and normal ranges when possible. "
+        "\n- When presenting query results, translate technical column names into user-friendly descriptions. "
+        "\n- Always include the number of rows returned to give context about the data volume."
     ),
     args_schema=QueryDuckDBInput
 )
 
-detect_anomalies_ml_tool: StructuredTool = StructuredTool.from_function(
-    func=detect_anomalies_ml,
-    name="detect_anomalies_ml",
+# The detect_anomalies_ml_tool has been removed as it's been replaced by the more efficient detect_anomalies_tool
+
+detect_anomalies_tool: StructuredTool = StructuredTool.from_function(
+    func=detect_anomalies,
+    name="detect_anomalies",
     description=(
-        "Detect anomalies in telemetry data using machine learning (Isolation Forest). "
-        "Parameters: db_path (string), table (string), columns (list of numerical column names). "
-        "Example: detect_anomalies_ml(db_path='/path/to/db.duckdb', table='telemetry_attitude', columns=['roll', 'pitch', 'yaw']). "
-        "Returns anomaly flags and scores for each row. Use this for unsupervised anomaly detection."
+        "Detect anomalies across multiple tables efficiently. "
+        "Parameters: db_path (string), tables (optional list of table names). "
+        "Example: detect_anomalies(db_path='/path/to/db.duckdb') or detect_anomalies(db_path='/path/to/db.duckdb', tables=['telemetry_attitude', 'telemetry_gps_raw_int']). "
+        "If tables parameter is omitted, will use priority tables (attitude, position, GPS, etc). "
+        "Returns combined results across all processed tables. Use this for broad anomaly queries across the entire dataset. "
+        "\n\nWhen discussing results, always provide context about tables and columns: "
+        "\n- When mentioning a specific table (e.g., 'telemetry_attitude'), explain what kind of data this table contains (e.g., 'the telemetry_attitude table contains vehicle orientation data including roll, pitch, and yaw angles'). "
+        "\n- When mentioning specific columns (e.g., 'roll'), explain what this column represents and its unit of measurement (e.g., 'the roll column represents the aircraft's roll angle measured in degrees'). "
+        "\n- For numerical values, include appropriate units and normal ranges when possible. "
+        "\n- Prioritize explaining tables and columns in a way that helps users understand the telemetry data without requiring technical knowledge."
     ),
-    args_schema=DetectAnomaliesMLInput
+    args_schema=DetectAnomaliesBatchInput
 )
 
 class TokenUsageCallback(BaseCallbackHandler):
@@ -616,6 +619,7 @@ class TelemetryAgent:
         self.agent_executor: Optional[AgentExecutor] = None
         self.scratchpad: AgentScratchpad = AgentScratchpad(session_id=session_id)
         self.logger: structlog.stdlib.BoundLogger = logger.bind(session_id=session_id)
+        self.anomaly_detector: Optional[AnomalyDetector] = None
 
     async def async_initialize(self) -> None:
         """Initialize TelemetryAgent dependencies asynchronously.
@@ -644,6 +648,14 @@ class TelemetryAgent:
             callbacks=[self.token_callback]
         )
 
+        # Initialize the anomaly detector in the background
+        # This will return quickly but start training models in the background
+        self.logger.info("Starting anomaly detector initialization")
+        self.anomaly_detector = AnomalyDetector(db_path=self.db_path)
+        # Start initialization but don't wait for model training
+        await self.anomaly_detector.initialize()
+        self.logger.info("Anomaly detector initialized successfully")
+
         # Get tables info for the prompt
         tables_info = await self.get_tables_as_string()
 
@@ -670,7 +682,7 @@ class TelemetryAgent:
         )
 
         # Set up ReAct agent with tools
-        tools: List[Tool] = [query_duckdb_tool, detect_anomalies_ml_tool]
+        tools: List[Tool] = [query_duckdb_tool, detect_anomalies_tool]
 
          # Create ReAct agent
         agent = create_react_agent(
@@ -802,20 +814,47 @@ class TelemetryAgent:
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Process a user message and generate a response with anomaly detection results.
 
+        This method handles the complete workflow of processing a user query about telemetry data:
+        1. Validates input parameters and token limits
+        2. Retrieves conversation history from memory
+        3. Performs vector search to identify relevant tables and anomaly hints
+        4. Enhances the user query with context information
+        5. Invokes the ReAct agent to process the query using available tools
+        6. Updates the agent's scratchpad with intermediate reasoning steps
+        7. Adds the conversation to memory for future reference
+        8. Returns the response with detailed metadata for debugging
+
         Args:
             message (str): User query about telemetry data (e.g., "Are there any GPS anomalies?").
             max_tokens (Optional[int]): Maximum tokens for LLM response (defaults to self.max_tokens).
 
         Returns:
-            Tuple[str, Optional[Dict[str, Any]]]: LLM response and optional metadata.
+            Tuple[str, Optional[Dict[str, Any]]]: 
+                - LLM response as a string
+                - Metadata dictionary containing token usage, intermediate steps, and other debug info
 
         Raises:
             ValueError: If message is empty, token limits are invalid, or agent is not initialized.
             asyncio.TimeoutError: If processing exceeds CHAT_TIMEOUT_SECONDS.
+            RuntimeError: If agent components are not properly initialized.
         """
+        # Validate input message
         if not message.strip():
-            self.logger.warning("Empty message provided, skipping processing")
+            self.logger.warning(ERROR_EMPTY_MESSAGE)
             return "", None
+            
+        # Validate agent components are initialized
+        if self.agent_executor is None:
+            self.logger.error(ERROR_AGENT_NOT_INITIALIZED)
+            raise RuntimeError(ERROR_AGENT_NOT_INITIALIZED)
+            
+        if self.conversation_memory_manager is None:
+            self.logger.error(ERROR_MEMORY_NOT_INITIALIZED)
+            raise RuntimeError(ERROR_MEMORY_NOT_INITIALIZED)
+            
+        if self.token_callback is None:
+            self.logger.error(ERROR_TOKEN_CALLBACK_NOT_INITIALIZED)
+            raise RuntimeError(ERROR_TOKEN_CALLBACK_NOT_INITIALIZED)
 
         try:
             # Use provided max_tokens or default
@@ -824,24 +863,25 @@ class TelemetryAgent:
             # Validate token limits
             if effective_max_tokens <= 0:
                 self.logger.error("max_tokens must be positive", max_tokens=effective_max_tokens)
-                raise ValueError(f"Invalid max_tokens: {effective_max_tokens} must be positive")
+                raise ValueError(ERROR_INVALID_MAX_TOKENS.format(effective_max_tokens))
+                
             if effective_max_tokens > MAX_TOKEN_SAFETY_LIMIT:
                 self.logger.error(
                     "max_tokens exceeds safety limit",
                     max_tokens=effective_max_tokens,
                     safety_limit=MAX_TOKEN_SAFETY_LIMIT
                 )
-                raise ValueError(f"max_tokens {effective_max_tokens} exceeds safety limit {MAX_TOKEN_SAFETY_LIMIT}")
+                raise ValueError(ERROR_MAX_TOKENS_EXCEEDS_LIMIT.format(
+                    effective_max_tokens, MAX_TOKEN_SAFETY_LIMIT))
+                
             if effective_max_tokens <= RESERVED_RESPONSE_TOKENS:
                 self.logger.error(
                     "max_tokens must be greater than RESERVED_RESPONSE_TOKENS",
                     max_tokens=effective_max_tokens,
                     reserved=RESERVED_RESPONSE_TOKENS
                 )
-                raise ValueError(
-                    f"max_tokens {effective_max_tokens} must be greater than "
-                    f"RESERVED_RESPONSE_TOKENS {RESERVED_RESPONSE_TOKENS}"
-                )
+                raise ValueError(ERROR_MAX_TOKENS_TOO_SMALL.format(
+                    effective_max_tokens, RESERVED_RESPONSE_TOKENS))
 
             # Reset token usage for this query
             self.token_callback.reset()
@@ -862,7 +902,7 @@ class TelemetryAgent:
                 chat_history_string = "No prior conversation history."
 
             # Identify relevant tables and hints using vector store
-            search_results = await self.vector_store_manager.asimilarity_search(
+            search_results = await self.vector_store_manager.async_similarity_search(
                 message, k=VECTOR_RETRIEVER_K
             )
             relevant_tables: List[str] = list(set( # Use set to ensure uniqueness
@@ -924,6 +964,9 @@ class TelemetryAgent:
             if is_clarification and not response.strip().lower().startswith("thought"): # Avoid adding to thoughts
                 self.logger.info("Response requests clarification", response=response)
                 response += "\nPlease provide more details to proceed."
+                
+            # We now handle anomaly detection queries earlier in the method
+            # by returning a direct message if models are still training
 
             await self.conversation_memory_manager.add_message((message, response))
 
@@ -962,14 +1005,16 @@ class TelemetryAgent:
                 "raw_agent_output": result.get("output", "") # Add raw output for easier debugging
             }
             
-            # Manage custom scratchpad size (Token check was here, keep it)
+            # Manage custom scratchpad size to prevent token limit issues
             scratchpad_tokens = len(self.token_encoder.encode(current_custom_scratchpad))
             if scratchpad_tokens > self.max_context_tokens // 2: # type: ignore
                 self.logger.warning(
-                    "Custom scratchpad content approaching token limit",
+                    ERROR_SCRATCHPAD_TOKEN_LIMIT,
                     tokens=scratchpad_tokens,
-                    max_context_tokens=self.max_context_tokens
+                    max_context_tokens=self.max_context_tokens,
+                    token_percentage=f"{(scratchpad_tokens / self.max_context_tokens) * 100:.1f}%"
                 )
+                # Keep only the most recent steps to reduce token usage
                 self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[-10:] 
                 self.logger.info("Truncated custom scratchpad to last 10 steps to manage token limit")
 
@@ -989,9 +1034,10 @@ class TelemetryAgent:
             self.logger.error(
                 "Message processing timed out",
                 message=message,
-                timeout=CHAT_TIMEOUT_SECONDS
+                timeout=CHAT_TIMEOUT_SECONDS,
+                session_id=self.session_id
             )
-            raise ValueError(f"Message processing timed out after {CHAT_TIMEOUT_SECONDS} seconds")
+            raise ValueError(ERROR_PROCESSING_TIMEOUT.format(CHAT_TIMEOUT_SECONDS))
         except Exception as e:
             self.logger.error(
                 "Failed to process message",

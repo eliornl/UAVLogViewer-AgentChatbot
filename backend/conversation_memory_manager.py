@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple, Union, TypeAlias, Dict, Any
+from typing import List, Optional, Tuple, Union, TypeAlias, Dict, Any, Callable
 from enum import Enum
 import asyncio
 import structlog
@@ -12,7 +12,7 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain.retrievers import TimeWeightedVectorStoreRetriever
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, trim_messages
+from langchain_core.messages import trim_messages
 from langchain_core.memory import BaseMemory
 from backend.llm_token_counter import LLMTokenCounter
 
@@ -22,37 +22,91 @@ logger = structlog.get_logger(__name__)
 MessagePair: TypeAlias = Tuple[str, str]
 DocumentList: TypeAlias = List[Document]
 
-# Constants
-SHORT_TERM_TOKEN_LIMIT: int = 1000
-MEDIUM_TERM_TOKEN_LIMIT: int = 3000
-VECTOR_RETRIEVER_DECAY_RATE: float = 0.5
-VECTOR_RETRIEVER_K: int = 4
+# Constants for memory configuration
+# Token limits for different memory strategies
+SHORT_TERM_TOKEN_LIMIT: int = 1000       # Maximum tokens for short-term memory
+MEDIUM_TERM_TOKEN_LIMIT: int = 3000      # Maximum tokens for medium-term memory
+
+# Vector retriever settings
+VECTOR_RETRIEVER_DECAY_RATE: float = 0.5  # Decay rate for time-weighted vector retrieval
+VECTOR_RETRIEVER_K: int = 4               # Number of results to retrieve from vector store
+
+# Buffer window settings
+DEFAULT_BUFFER_WINDOW_SIZE: int = 10      # Default number of messages to keep in buffer window
+DEFAULT_TOKEN_LIMIT: int = 1000          # Default token limit for buffer window memory
+
+# Performance settings
 MEMORY_UPDATE_TIMEOUT_SECONDS: float = 60.0  # Timeout for memory updates
 
 class CustomBufferWindowMemory(BaseMemory):
+    """
+    Memory implementation that keeps a window of conversation history based on token count.
+    
+    This implementation maintains recent conversation history up to a specified token limit,
+    rather than a fixed number of messages. It's useful for short-term memory in conversation
+    systems where context needs to be managed within token constraints.
+    
+    Attributes:
+        chat_memory: Storage for the conversation messages
+        max_token_limit: Maximum number of tokens to retain (default: DEFAULT_TOKEN_LIMIT)
+        k: Legacy parameter for number of messages (used as fallback if token counting fails)
+        memory_key: Key to use when returning the memory in load_memory_variables
+        return_messages: Whether to return messages directly or as a formatted string
+        input_key: Key for identifying the input field in the inputs dictionary
+        output_key: Key for identifying the output field in the outputs dictionary
+        token_counter: Function to count tokens in messages (defaults to None)
+    """
     chat_memory: ChatMessageHistory
-    k: int = 10
+    max_token_limit: int = DEFAULT_TOKEN_LIMIT
+    k: int = DEFAULT_BUFFER_WINDOW_SIZE  # Fallback if token counting fails
     memory_key: str = "history"
     return_messages: bool = True
     input_key: Optional[str] = None
     output_key: Optional[str] = None
+    token_counter: Optional[Callable] = None
 
     @property
     def memory_variables(self) -> List[str]:
+        """
+        Return the memory variables that are accessed in this memory.
+        
+        Returns:
+            List[str]: List containing the memory key used by this memory component
+        """
         return [self.memory_key]
 
-    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
+    def load_memory_variables(self, _: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Load memory variables from the chat history, keeping messages up to the token limit.
+        
+        This method retrieves messages from the chat history up to the specified token limit,
+        preserving any system message at the beginning. It uses the trim_messages
+        function to select messages while maintaining conversation integrity.
+        
+        Returns:
+            Dict[str, Any]: Dictionary with memory_key mapped to either a list of
+                           messages or a formatted string (if return_messages=False)
+                           
+        Raises:
+            NotImplementedError: If return_messages=False, as string formatting is
+                                not fully implemented
+        """
         messages = self.chat_memory.messages
-        # Use SystemMessage if present as the first message for include_system
-        # trim_messages expects a list of BaseMessage
         
-        # Determine if a system message is present at the beginning
-        # For include_system=True, trim_messages handles preserving the first SystemMessage
+        # Use token counter if provided, otherwise fall back to message count
+        token_counter_fn = self.token_counter
+        max_tokens = self.max_token_limit
         
+        # If no token counter is provided, fall back to message count
+        if token_counter_fn is None:
+            token_counter_fn = len  # Count messages instead of tokens
+            max_tokens = self.k     # Use k as the maximum number of messages
+        
+        # Trim messages based on token count or message count
         windowed_messages = trim_messages(
             messages,
-            max_tokens=self.k, # k is number of messages here
-            token_counter=len, # Counts number of messages
+            max_tokens=max_tokens,
+            token_counter=token_counter_fn,
             strategy="last",
             start_on="human", # Default, good for most chat models
             include_system=True, # Preserves first system message if any
@@ -75,10 +129,22 @@ class CustomBufferWindowMemory(BaseMemory):
 
 
     def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
-        # This logic assumes inputs has one key (e.g. "input" or "human_input")
-        # and outputs has one key (e.g. "output" or "ai_output")
-        # This matches how LLMChain and agents typically save context.
+        """
+        Save the context of this conversation turn to the memory.
         
+        This method extracts the user input and AI output from the provided dictionaries
+        and adds them to the chat history. It intelligently handles cases where input_key
+        and output_key are specified or when they need to be inferred from the dictionaries.
+        
+        Args:
+            inputs (Dict[str, Any]): Dictionary containing the user's input message
+            outputs (Dict[str, str]): Dictionary containing the AI's output message
+            
+        Note:
+            This logic assumes inputs has one key (e.g. "input" or "human_input")
+            and outputs has one key (e.g. "output" or "ai_output").
+            This matches how LLMChain and agents typically save context.
+        """
         # Determine input message string
         if self.input_key is None:
             input_str = next(iter(inputs.values())) # Get the first value
@@ -96,6 +162,12 @@ class CustomBufferWindowMemory(BaseMemory):
 
 
     def clear(self) -> None:
+        """
+        Clear all messages from the chat memory.
+        
+        This method removes all stored messages from the chat history,
+        effectively resetting the conversation memory to its initial state.
+        """
         self.chat_memory.clear()
 
 MemoryType: TypeAlias = Union[
@@ -293,7 +365,8 @@ class ConversationMemoryManager:
     async def _initialize_short_term_memory(
         self, history: List[MessagePair]
     ) -> Tuple[CustomBufferWindowMemory, MemoryStrategy]:
-        """Initialize short-term memory asynchronously for low token counts.
+        """
+        Initialize short-term memory asynchronously for low token counts.
 
         Args:
             history: List of (user_content, assistant_content) tuples.
@@ -307,9 +380,11 @@ class ConversationMemoryManager:
         self.logger.info("Initializing SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT)
         memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10,  # Store the last 10 messages
+            max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
+            k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
             memory_key="history", # Explicitly set
-            return_messages=True   # Explicitly set
+            return_messages=True,  # Explicitly set
+            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
         )
 
         def load_messages() -> None:
@@ -341,9 +416,11 @@ class ConversationMemoryManager:
         self.logger.info("Initializing MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
         buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10,  # Store the last 10 messages
+            max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
+            k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
             memory_key="buffer_history", # Explicitly set
-            return_messages=True         # Explicitly set
+            return_messages=True,        # Explicitly set
+            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
@@ -393,9 +470,11 @@ class ConversationMemoryManager:
         # Initialize memory components
         buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
-            k=10,  # Store the last 10 messages
+            max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
+            k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
             memory_key="buffer_history", # Explicitly set
-            return_messages=True         # Explicitly set
+            return_messages=True,        # Explicitly set
+            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,

@@ -13,9 +13,16 @@ logger = structlog.get_logger(__name__)
 # Type alias for clarity
 DocumentList: TypeAlias = List[Document]
 
-# Constants
+# Constants for vector store operations
 VECTOR_INIT_TIMEOUT_SECONDS: float = 30.0  # Timeout for vector store initialization
 VECTOR_SEARCH_TIMEOUT_SECONDS: float = 30.0  # Timeout for vector store similarity search
+DEFAULT_SEARCH_RESULTS: int = 4      # Default number of results to return from similarity search
+
+# Error messages for better consistency
+ERROR_NOT_INITIALIZED: str = "Vector store not initialized"
+ERROR_EMPTY_SCHEMA: str = "TELEMETRY_SCHEMA is empty; cannot initialize vector store"
+ERROR_INVALID_API_KEY: str = "Failed to initialize vector store: Invalid OpenAI API key"
+ERROR_NETWORK: str = "Failed to initialize vector store: Network error during embeddings API call"
 
 class VectorStoreManager:
     """Manages the FAISS vector store for telemetry schema embeddings.
@@ -63,7 +70,7 @@ class VectorStoreManager:
         ]
         if not documents:
             self.logger.error("TELEMETRY_SCHEMA is empty")
-            raise ValueError("TELEMETRY_SCHEMA is empty; cannot initialize vector store")
+            raise ValueError(ERROR_EMPTY_SCHEMA)
 
         try:
             def init_vector_store() -> FAISS:
@@ -76,10 +83,10 @@ class VectorStoreManager:
             self.logger.info("Initialized FAISS vector store", document_count=len(documents))
         except openai.AuthenticationError as e:
             self.logger.error("Invalid OpenAI API key for embeddings", error=str(e))
-            raise ValueError("Failed to initialize vector store: Invalid OpenAI API key") from e
+            raise ValueError(ERROR_INVALID_API_KEY) from e
         except requests.RequestException as e:
             self.logger.error("Network error during embeddings API call", error=str(e))
-            raise ValueError("Failed to initialize vector store: Network error during embeddings API call") from e
+            raise ValueError(ERROR_NETWORK) from e
         except asyncio.TimeoutError:
             self.logger.error("Vector store initialization timed out", timeout=timeout_seconds)
             raise ValueError(f"Vector store initialization timed out after {timeout_seconds} seconds")
@@ -87,23 +94,28 @@ class VectorStoreManager:
             self.logger.error("Unexpected error during vector store initialization", error=str(e), exc_info=True)
             raise ValueError(f"Failed to initialize vector store: {str(e)}") from e
 
-    async def asimilarity_search(self, query: str, k: int = 4) -> DocumentList:
+    async def async_similarity_search(self, query: str, k: int = DEFAULT_SEARCH_RESULTS) -> DocumentList:
         """Perform an asynchronous similarity search on the vector store.
 
+        Searches the vector store for documents similar to the query and returns
+        the top k results with their metadata. This is useful for finding relevant
+        telemetry tables based on natural language descriptions.
+
         Args:
-            query: Query string to search for.
-            k: Number of results to return (default: 4).
+            query: Query string to search for (natural language description)
+            k: Number of results to return (default: DEFAULT_SEARCH_RESULTS)
 
         Returns:
-            DocumentList: List of Document objects with table and anomaly_hint metadata.
+            DocumentList: List of Document objects with table and anomaly_hint metadata
 
         Raises:
-            ValueError: If search fails due to network or other errors.
-            asyncio.TimeoutError: If search exceeds VECTOR_SEARCH_TIMEOUT_SECONDS.
+            ValueError: If search fails due to vector store not being initialized,
+                       network errors, or other issues
+            asyncio.TimeoutError: If search exceeds VECTOR_SEARCH_TIMEOUT_SECONDS
         """
         if self.vector_store is None:
-            self.logger.error("Vector store not initialized")
-            raise ValueError("Vector store not initialized")
+            self.logger.error(ERROR_NOT_INITIALIZED)
+            raise ValueError(ERROR_NOT_INITIALIZED)
 
         try:
             def run_search() -> DocumentList:

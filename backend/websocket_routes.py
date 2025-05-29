@@ -1,10 +1,13 @@
 """WebSocket routes for the FastAPI application.
 
 This module defines the WebSocket endpoints for real-time chat communication.
+It handles connection establishment, message processing, and proper cleanup
+when connections are closed.
 """
 
 import asyncio
 import structlog
+from typing import Dict, Any, Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from starlette.websockets import WebSocketState
 from backend.websocket_handler import (
@@ -12,8 +15,13 @@ from backend.websocket_handler import (
     disconnect_websocket,
     handle_websocket_message
 )
-
 from backend.utils import validate_uuid
+
+# Constants for WebSocket configuration
+WS_RECEIVE_TIMEOUT_SECONDS: int = 3600  # 1 hour timeout for receiving messages
+WS_INVALID_SESSION_CODE: int = 1008    # WebSocket close code for invalid session
+WS_NORMAL_CLOSURE_CODE: int = 1000     # Normal closure code
+WS_INTERNAL_ERROR_CODE: int = 1011     # Internal error code
 
 # Create a dedicated logger for WebSocket routes
 logger = structlog.get_logger("websocket_routes")
@@ -22,12 +30,20 @@ logger = structlog.get_logger("websocket_routes")
 router = APIRouter()
 
 @router.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
+async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """WebSocket endpoint for real-time chat communication.
     
+    Establishes a WebSocket connection for the specified session, handles incoming
+    messages, and manages the connection lifecycle. The connection supports token
+    streaming for real-time chat responses and maintains session isolation.
+    
     Args:
-        websocket: The WebSocket connection
-        session_id: The session ID to associate with this connection
+        websocket: The WebSocket connection object
+        session_id: The unique session ID to associate with this connection
+        
+    Note:
+        The connection will automatically close after WS_RECEIVE_TIMEOUT_SECONDS
+        of inactivity to prevent resource leaks.
     """
     # Create session-specific logger
     session_logger = logger.bind(session_id=session_id)
@@ -36,7 +52,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     try:
         validate_uuid(session_id)
     except Exception:
-        await websocket.close(code=1008, reason="Invalid session ID format")
+        await websocket.close(code=WS_INVALID_SESSION_CODE, reason="Invalid session ID format")
         session_logger.warning("Invalid session ID format")
         return
     
@@ -50,25 +66,28 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     
     # Handle messages
     try:
-        # Set receive timeout to prevent hanging connections
-        receive_timeout = 3600  # 1 hour timeout
-        
         while True:
             try:
-                # Receive JSON message with timeout
+                # Receive JSON message with timeout to prevent hanging connections
                 data = await asyncio.wait_for(
                     websocket.receive_json(),
-                    timeout=receive_timeout
+                    timeout=WS_RECEIVE_TIMEOUT_SECONDS
                 )
                 
-                # Process message
+                # Process message through the websocket handler
                 await handle_websocket_message(websocket, session_id, data)
                 
             except asyncio.TimeoutError:
                 # Connection has been idle for too long
-                session_logger.info("WebSocket connection timed out after inactivity", timeout_seconds=receive_timeout)
+                session_logger.info(
+                    "WebSocket connection timed out after inactivity", 
+                    timeout_seconds=WS_RECEIVE_TIMEOUT_SECONDS
+                )
                 if websocket.client_state == WebSocketState.CONNECTED:
-                    await websocket.close(code=status.WS_1000_NORMAL_CLOSURE, reason="Connection timeout due to inactivity")
+                    await websocket.close(
+                        code=WS_NORMAL_CLOSURE_CODE, 
+                        reason="Connection timeout due to inactivity"
+                    )
                 break
             
     except WebSocketDisconnect as e:
@@ -88,6 +107,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
         # Only try to close if still connected
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
-                await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Server error")
+                await websocket.close(code=WS_INTERNAL_ERROR_CODE, reason="Server error")
             except Exception:
+                session_logger.debug("Failed to close WebSocket connection that was already closed")
                 pass  # Connection might already be closed

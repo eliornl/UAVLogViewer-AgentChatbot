@@ -5,7 +5,6 @@ import duckdb
 import structlog
 import time
 import aiofiles
-import mimetypes
 import json
 from json import JSONEncoder
 from contextlib import asynccontextmanager
@@ -43,11 +42,25 @@ class CustomJSONEncoder(JSONEncoder):
         return super().default(obj)
 
 # Constants
-ALLOWED_EXTENSIONS: Set[str] = {".bin", ".tlog"}
+# File handling constants
+ALLOWED_EXTENSIONS: Set[str] = {".bin", ".tlog"}  # Supported flight log file extensions
+MAX_FILE_SIZE: int = 100 * 1024 * 1024  # 100 MB - Maximum allowed file size for uploads
+CHUNK_SIZE: int = 1048576  # 1 MB - Chunk size for file reading/writing operations
+
+# Media types for responses
 JSON_MEDIA_TYPE: str = "application/json"
 TEXT_MEDIA_TYPE: str = "text/plain"
+CSV_MEDIA_TYPE: str = "text/csv"
+
+# Session management constants
 MAX_MESSAGES: int = 10_000  # Limit messages per session to prevent memory issues
-FILENAME_SAFE_CHARS: str = "abcdefghijklmnopqrstuvwxyz0123456789-_"
+MAX_SESSIONS: int = 1000  # Maximum number of concurrent sessions allowed
+MAX_SESSION_ATTEMPTS: int = 5  # Maximum attempts to generate a unique session ID
+CHAT_TIMEOUT_SECONDS: float = 30.0  # Timeout for chat message processing
+
+# File naming constants
+FILENAME_SAFE_CHARS: str = "abcdefghijklmnopqrstuvwxyz0123456789-_"  # Safe characters for filenames
+DUCKDB_FILE_PREFIX: str = ""  # Prefix for DuckDB database files
 
 # Configure structlog for structured logging
 structlog.configure(
@@ -67,44 +80,36 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 load_dotenv()
 
 # Environment variables with type hints
-ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080").split(",")
-ALLOWED_METHODS: List[str] = os.getenv("ALLOWED_METHODS", "GET,POST,DELETE,OPTIONS").split(",")
-ALLOWED_HEADERS: List[str] = os.getenv("ALLOWED_HEADERS", "Content-Type,Authorization,X-Session-ID").split(",")
-ALLOW_CREDENTIALS: bool = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
-MAX_FILE_SIZE: int = int(float(os.getenv("MAX_FILE_SIZE_MB", "100")) * 1024 * 1024)
+# Keep only the essential environment variables
 STORAGE_DIR: str = os.path.abspath(os.getenv("STORAGE_DIR", "./storage"))
-CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "1048576"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-MAX_SESSION_ATTEMPTS: int = int(os.getenv("MAX_SESSION_ATTEMPTS", "5"))
-DUCKDB_FILE_PREFIX: str = os.getenv("DUCKDB_FILE_PREFIX", "")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
-CHAT_TIMEOUT_SECONDS: float = float(os.getenv("CHAT_TIMEOUT_SECONDS", "30"))
-MAX_SESSIONS: int = int(os.getenv("MAX_SESSIONS", "1000"))
+
+# These constants are now defined at the top of the file
 
 # Validate environment variables
 def validate_env_vars() -> None:
-    """Validate environment variables and raise ValueError if invalid."""
+    """Validate essential environment variables and raise ValueError if invalid.
+    
+    Checks:
+        - OPENAI_API_KEY: Must be provided for LLM functionality
+        - STORAGE_DIR: Must exist and be writable
+        - LLM_MODEL: Not validated but used for LLM initialization
+        - LOG_LEVEL: Not validated but used for logging configuration
+    """
     if not OPENAI_API_KEY:
         logger.error("OPENAI_API_KEY is not set")
-        raise ValueError("OPENAI_API_KEY must be set in .env")
-    if CHAT_TIMEOUT_SECONDS <= 0:
-        logger.error("CHAT_TIMEOUT_SECONDS must be positive")
-        raise ValueError("CHAT_TIMEOUT_SECONDS must be positive")
-    if MAX_SESSIONS <= 0:
-        logger.error("MAX_SESSIONS must be positive")
-        raise ValueError("MAX_SESSIONS must be positive")
-    if ".." in os.path.relpath(STORAGE_DIR):
-        logger.error("STORAGE_DIR contains parent directory references")
-        raise ValueError("STORAGE_DIR cannot contain parent directory references")
+        raise ValueError("OPENAI_API_KEY environment variable is required")
+        
+    # Ensure storage directory exists and is writable
     if not os.path.exists(STORAGE_DIR):
         os.makedirs(STORAGE_DIR, exist_ok=True)
+        logger.info("Created storage directory", storage_dir=STORAGE_DIR)
+    
     if not os.path.isdir(STORAGE_DIR) or not os.access(STORAGE_DIR, os.W_OK):
         logger.error("STORAGE_DIR is not a writable directory", storage_dir=STORAGE_DIR)
-        raise ValueError(f"STORAGE_DIR '{STORAGE_DIR}' is not a writable directory")
-    if ALLOW_CREDENTIALS and "*" in ALLOWED_ORIGINS:
-        logger.error("Credentials cannot be used with wildcard origins")
-        raise ValueError("Credentials cannot be used with wildcard origins")
+        raise ValueError(f"Storage directory '{STORAGE_DIR}' is not a writable directory")
 
 validate_env_vars()
 
@@ -711,15 +716,18 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
 
 async def stream_json_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
     """Stream JSON messages to reduce memory usage for large exports.
+    
+    Formats each message as a JSON object with sender, timestamp, and message fields.
+    Yields chunks of the JSON array to avoid loading the entire dataset into memory.
 
     Args:
-        messages: List of messages to serialize.
+        messages: List of Message objects to serialize to JSON.
 
     Yields:
-        bytes: Chunks of JSON-encoded data.
+        bytes: Chunks of UTF-8 encoded JSON data.
 
     Raises:
-        ValueError: If JSON serialization fails.
+        ValueError: If JSON serialization fails for any message.
     """
     yield b"["
     for i, message in enumerate(messages):
@@ -744,12 +752,15 @@ async def stream_json_messages(messages: List[Message]) -> AsyncGenerator[bytes,
 
 async def stream_text_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
     """Stream text messages to reduce memory usage for large exports.
-
+    
+    Formats each message in the format: [timestamp] Role: Message
+    with double line breaks between messages for readability.
+    
     Args:
-        messages: List of messages to serialize.
+        messages: List of Message objects to format as text.
 
     Yields:
-        bytes: Chunks of text-encoded data.
+        bytes: Chunks of UTF-8 encoded text data.
     """
     for message in messages:
         timestamp = message.timestamp.strftime("%Y-%m-%d %H:%M:%S")
@@ -763,12 +774,15 @@ async def stream_text_messages(messages: List[Message]) -> AsyncGenerator[bytes,
 
 async def stream_csv_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
     """Stream CSV messages to reduce memory usage for large exports.
-
+    
+    Creates a CSV file with columns: sender, timestamp, message.
+    Properly escapes and quotes message content according to CSV standards.
+    
     Args:
-        messages: List of messages to serialize.
+        messages: List of Message objects to format as CSV rows.
 
     Yields:
-        bytes: Chunks of CSV-encoded data.
+        bytes: Chunks of UTF-8 encoded CSV data, starting with a header row.
     """
     # CSV header
     yield b"sender,timestamp,message\n"
@@ -792,20 +806,28 @@ async def stream_csv_messages(messages: List[Message]) -> AsyncGenerator[bytes, 
 async def export_chat(session_id: str, format: str = "json") -> StreamingResponse:
     """Export chat messages for a session as a downloadable file in the specified format.
 
+    This endpoint provides a streaming response to efficiently handle large chat histories
+    without loading the entire conversation into memory. It supports three export formats:
+    
     Supported formats:
-    - json: A JSON array of objects with sender, timestamp, message, and optional metadata.
-    - text: Plain text format with [timestamp] Sender: Message format.
-    - csv: CSV format with sender, timestamp, and message columns.
+    - json: A JSON array of objects with sender, timestamp, and message fields
+    - text: Plain text format with [timestamp] Sender: Message format and double line breaks
+    - csv: CSV format with sender, timestamp, and message columns (message content is properly escaped)
 
+    The response includes appropriate Content-Disposition headers for browser download
+    and CORS headers to ensure cross-origin compatibility.
+    
     Args:
-        session_id: Unique session identifier.
+        session_id: Unique session identifier (UUID).
         format: Export format (json, text, or csv). Defaults to json.
 
     Returns:
-        StreamingResponse: File with Content-Disposition for download.
+        StreamingResponse: Streaming response with appropriate Content-Type and
+                          Content-Disposition headers for file download.
 
     Raises:
         HTTPException: If session_id is invalid, session not found, or no messages exist.
+                      Also if an unsupported format is requested.
     """
     start_time: float = time.perf_counter()
     validate_uuid(session_id)
@@ -815,7 +837,7 @@ async def export_chat(session_id: str, format: str = "json") -> StreamingRespons
     session_lock: Optional[asyncio.Lock] = None
     async with global_sessions_lock:
         if session_id not in sessions:
-            logger.error("Session not found", session_id=session_id)
+            session_logger.error("Session not found", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
@@ -846,9 +868,9 @@ async def export_chat(session_id: str, format: str = "json") -> StreamingRespons
         file_extension = "." + format
         if format == "text":
             file_extension = ".txt"
-            media_type = "text/plain"
+            media_type = TEXT_MEDIA_TYPE
         elif format == "csv":
-            media_type = "text/csv"
+            media_type = CSV_MEDIA_TYPE
         else:  # json
             media_type = JSON_MEDIA_TYPE
         
@@ -885,7 +907,7 @@ async def export_chat(session_id: str, format: str = "json") -> StreamingRespons
                 headers=headers,
             )
         except ValueError as e:
-            logger.error(
+            session_logger.error(
                 "Failed to export chat messages",
                 session_id=session_id,
                 error=str(e),
@@ -903,26 +925,38 @@ async def export_chat(session_id: str, format: str = "json") -> StreamingRespons
             )
 
 @app.get("/get_messages/{session_id}")
-async def get_messages(session_id: str):
-    """Get all messages for a session.
+async def get_messages(session_id: str) -> List[Dict[str, Any]]:
+    """Get all messages for a session in a format suitable for the frontend.
+    
+    This endpoint retrieves the complete chat history for a specific session,
+    including user and assistant messages with their timestamps and metadata.
+    It's used by the frontend to display the chat interface when a user returns
+    to a previous session.
+    
+    The messages are returned in chronological order and include:
+    - message_id: Unique identifier for the message
+    - role: Either 'user' or 'assistant'
+    - content: The actual message text
+    - timestamp: ISO-formatted timestamp
+    - metadata: Optional metadata from assistant messages (may include tool usage info)
 
     Args:
-        session_id: Unique session identifier.
+        session_id: Unique session identifier (UUID).
 
     Returns:
-        List of messages for the session.
+        List[Dict[str, Any]]: List of message objects with all necessary fields for display.
 
     Raises:
-        HTTPException: If session_id is invalid or session not found.
+        HTTPException: If session_id is invalid or session not found (404).
     """
     validate_uuid(session_id)
-    session_logger = logger.bind(session_id=session_id)
+    session_logger = logger.bind(session_id=session_id)  # Consistent variable naming
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
     async with global_sessions_lock:
         if session_id not in sessions:
-            logger.error("Session not found", session_id=session_id)
+            session_logger.error("Session not found", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",

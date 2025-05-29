@@ -21,6 +21,14 @@ class DateTimeEncoder(json.JSONEncoder):
             return obj.isoformat()
         return super().default(obj)
 
+# Constants for WebSocket handler configuration
+WS_TOKEN_DELAY_SECONDS: float = 0.05  # Delay between token streaming
+WS_INVALID_SESSION_CODE: int = 1008  # WebSocket close code for invalid session
+WS_ERROR_MESSAGE_TYPE: str = "error"  # Message type for error responses
+WS_STREAM_START_TYPE: str = "stream_start"  # Message type for stream start
+WS_STREAM_TOKEN_TYPE: str = "stream_token"  # Message type for token streaming
+WS_STREAM_END_TYPE: str = "stream_end"  # Message type for stream end
+
 # Create a dedicated logger for WebSocket handler
 logger = structlog.get_logger("websocket_handler")
 
@@ -41,6 +49,9 @@ async def send_json_safe(websocket: WebSocket, data: Any) -> None:
 async def connect_websocket(websocket: WebSocket, session_id: str) -> bool:
     """Accept a WebSocket connection and register it with a session.
     
+    This function validates the session, accepts the WebSocket connection if valid,
+    and registers it in the active_connections dictionary for future communication.
+    
     Args:
         websocket: The WebSocket connection to register
         session_id: The session ID to associate with this connection
@@ -53,7 +64,7 @@ async def connect_websocket(websocket: WebSocket, session_id: str) -> bool:
     
     # Validate session exists
     if session_id not in sessions:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid session")
+        await websocket.close(code=WS_INVALID_SESSION_CODE, reason="Invalid session")
         session_logger.warning("WebSocket connection rejected - invalid session")
         return False
     
@@ -133,9 +144,10 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
     # Validate message format
     if 'message' not in data:
         await send_json_safe(websocket, {
-            "type": "error",
+            "type": WS_ERROR_MESSAGE_TYPE,
             "message": "Invalid message format: 'message' field is required"
         })
+        session_logger.warning("Invalid message format received - missing message field")
         return
     
     message_text = data['message']
@@ -152,9 +164,10 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
         )
     except ValueError as e:
         await send_json_safe(websocket, {
-            "type": "error",
+            "type": WS_ERROR_MESSAGE_TYPE,
             "message": f"Invalid request: {str(e)}"
         })
+        session_logger.warning("Invalid chat request", error=str(e))
         return
     
     # Get session lock
@@ -162,9 +175,10 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
         # Validate session exists
         if session_id not in sessions:
             await send_json_safe(websocket, {
-                "type": "error",
+                "type": WS_ERROR_MESSAGE_TYPE,
                 "message": "Invalid session ID"
             })
+            session_logger.warning("Message received for invalid session")
             return
             
         session: Session = sessions[session_id]
@@ -183,7 +197,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
                 session_logger.warning(f"Rejected message - invalid session state: {session.status}")
                 
             await send_json_safe(websocket, {
-                "type": "error",
+                "type": WS_ERROR_MESSAGE_TYPE,
                 "message": error_message
             })
             return
@@ -213,7 +227,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
                 
                 if not agent:
                     await send_json_safe(websocket, {
-                        "type": "error",
+                        "type": WS_ERROR_MESSAGE_TYPE,
                         "message": "Failed to initialize agent for this session"
                     })
                     session_logger.error("Failed to initialize agent for session")
@@ -222,7 +236,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
                 session_logger.info("Agent initialized for WebSocket session")
             except Exception as e:
                 await send_json_safe(websocket, {
-                    "type": "error",
+                    "type": WS_ERROR_MESSAGE_TYPE,
                     "message": f"Error initializing agent: {str(e)}"
                 })
                 session_logger.error("Error initializing agent", error=str(e), exc_info=True)
@@ -234,7 +248,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
         try:
             # Start streaming
             await send_json_safe(websocket, {
-                "type": "stream_start",
+                "type": WS_STREAM_START_TYPE,
                 "message_id": message_id
             })
             
@@ -258,7 +272,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
                     for word in words:
                         token_count += 1
                         yield word + " "
-                        await asyncio.sleep(0.05)  # Small delay between tokens
+                        await asyncio.sleep(WS_TOKEN_DELAY_SECONDS)  # Small delay between tokens
                 except Exception as e:
                     session_logger.error(
                         "Error during token generation",
@@ -271,7 +285,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
             try:
                 async for token in token_generator():
                     await send_json_safe(websocket, {
-                        "type": "stream_token",
+                        "type": WS_STREAM_TOKEN_TYPE,
                         "token": token
                     })
                 session_logger.info("Completed token streaming", token_count=token_count)
@@ -297,7 +311,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
             
             # End streaming
             await send_json_safe(websocket, {
-                "type": "stream_end",
+                "type": WS_STREAM_END_TYPE,
                 "message_id": message_id,
                 "response": chat_response.model_dump()
             })
@@ -339,7 +353,7 @@ async def handle_websocket_message(websocket: WebSocket, session_id: str, data: 
             )
             
             await send_json_safe(websocket, {
-                "type": "error",
+                "type": WS_ERROR_MESSAGE_TYPE,
                 "message": f"Error processing message: {str(e)}",
                 "response": error_response.model_dump()
             })

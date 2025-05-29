@@ -7,20 +7,31 @@ from pydantic import BaseModel, Field, field_validator, ConfigDict, computed_fie
 # Type alias for metadata to ensure consistent usage
 MetadataDict: TypeAlias = Dict[str, Any]
 
-# Constants for validation
+# Constants for validation and limits
+# String length limits
 MAX_ID_LENGTH: int = 36  # UUID length for session_id, message_id
 MAX_FILE_NAME_LENGTH: int = 255  # Standard filesystem limit
 MAX_CONTENT_LENGTH: int = 10000  # Limit for message content
 MAX_MESSAGE_LENGTH: int = 5000  # Limit for user message in ChatRequest
+MAX_STATUS_MESSAGE_LENGTH: int = 1000  # Limit for status messages
+
+# Numeric limits
 MAX_FILE_SIZE: int = 1024 * 1024 * 100  # 100 MB max file size
 MAX_MESSAGES: int = 1000  # Max messages per session
 MAX_METADATA_SIZE: int = 100  # Max key-value pairs in metadata
-MAX_TOKEN_SAFETY_LIMIT: int = 16384  # From telemetry_agent.py
+MAX_TOKEN_SAFETY_LIMIT: int = 16384  # Maximum token limit for LLM responses
+MAX_RELEVANT_TABLES: int = 50  # Maximum number of relevant tables in metadata
+MAX_QUERY_LENGTH: int = 1000  # Maximum SQL query length in metadata
+
+# Regex patterns for validation
 ID_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_]+$")  # Alphanumeric, hyphens, underscores
-# UUID pattern for session IDs and message IDs
 UUID_PATTERN: re.Pattern = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # UUID format
 FILE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_\.]+$")  # Alphanumeric, hyphens, underscores, dots
+TABLE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9_]+$")  # Valid SQL table name pattern
+
+# Type constants
 ROLE_TYPES: tuple[str, ...] = ("user", "assistant")
+TOKEN_USAGE_KEYS: set[str] = {"prompt_tokens", "completion_tokens", "total_tokens"}
 
 class ResponseStatus(str, Enum):
     """Status codes for API responses."""
@@ -45,35 +56,64 @@ class Metadata(BaseModel):
     @field_validator("relevant_tables", mode="before")
     @classmethod
     def validate_relevant_tables(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        """Ensure relevant_tables contains valid table names."""
+        """Ensure relevant_tables contains valid table names.
+        
+        Args:
+            v: List of table names to validate or None
+            
+        Returns:
+            The validated list of table names or None
+            
+        Raises:
+            ValueError: If too many tables or invalid table names are provided
+        """
         if v is None:
             return None
-        if len(v) > 50:  # Arbitrary limit to prevent abuse
-            raise ValueError("Too many relevant tables, maximum is 50")
+        if len(v) > MAX_RELEVANT_TABLES:
+            raise ValueError(f"Too many relevant tables, maximum is {MAX_RELEVANT_TABLES}")
         for table in v:
-            if not table or len(table) > 100 or not re.match(r"^[a-zA-Z0-9_]+$", table):
+            if not table or len(table) > 100 or not TABLE_NAME_PATTERN.match(table):
                 raise ValueError(f"Invalid table name: {table}")
         return v
 
     @field_validator("query", mode="before")
     @classmethod
     def validate_query(cls, v: Optional[str]) -> Optional[str]:
-        """Ensure query is a valid SQL string."""
+        """Ensure query is a valid SQL string.
+        
+        Args:
+            v: SQL query string to validate or None
+            
+        Returns:
+            The validated SQL query string or None
+            
+        Raises:
+            ValueError: If the query exceeds the maximum length
+        """
         if v is None:
             return None
-        if len(v) > 1000:
-            raise ValueError("SQL query too long, maximum length is 1000 characters")
+        if len(v) > MAX_QUERY_LENGTH:
+            raise ValueError(f"SQL query too long, maximum length is {MAX_QUERY_LENGTH} characters")
         return v
 
     @field_validator("token_usage", mode="before")
     @classmethod
     def validate_token_usage(cls, v: Optional[Dict[str, int]]) -> Optional[Dict[str, int]]:
-        """Ensure token_usage contains valid keys and values."""
+        """Ensure token_usage contains valid keys and values.
+        
+        Args:
+            v: Dictionary of token usage statistics or None
+            
+        Returns:
+            The validated token usage dictionary or None
+            
+        Raises:
+            ValueError: If invalid keys or non-integer values are provided
+        """
         if v is None:
             return None
-        expected_keys = {"prompt_tokens", "completion_tokens", "total_tokens"}
-        if not all(key in expected_keys for key in v):
-            raise ValueError(f"Invalid token_usage keys, expected {expected_keys}")
+        if not all(key in TOKEN_USAGE_KEYS for key in v):
+            raise ValueError(f"Invalid token_usage keys, expected {TOKEN_USAGE_KEYS}")
         if any(not isinstance(val, int) or val < 0 for val in v.values()):
             raise ValueError("token_usage values must be non-negative integers")
         return v
@@ -211,7 +251,7 @@ class Session(BaseModel):
     status_message: Optional[str] = Field(
         default=None,
         description="Descriptive message for the session status",
-        max_length=1000
+        max_length=MAX_STATUS_MESSAGE_LENGTH
     )
     messages: List[Message] = Field(
         default_factory=list,
@@ -297,7 +337,7 @@ class UploadResponse(BaseModel):
     message: str = Field(
         ...,
         description="Descriptive result message",
-        max_length=1000,
+        max_length=MAX_STATUS_MESSAGE_LENGTH,
         min_length=1
     )
     request_duration: float = Field(
@@ -522,7 +562,7 @@ class DeleteSessionResponse(BaseModel):
     message: str = Field(
         ...,
         description="Descriptive result message",
-        max_length=1000,
+        max_length=MAX_STATUS_MESSAGE_LENGTH,
         min_length=1
     )
     request_duration: float = Field(

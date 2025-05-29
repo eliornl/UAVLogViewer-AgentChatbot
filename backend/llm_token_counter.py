@@ -1,4 +1,5 @@
-from typing import List, Tuple
+from typing import List, Tuple, Any, Callable
+from langchain_core.messages import BaseMessage
 import tiktoken
 import structlog
 
@@ -111,6 +112,45 @@ class LLMTokenCounter:
             total_tokens=total_tokens
         )
         return total_tokens
+        
+    def count_message_tokens(self, message: BaseMessage) -> int:
+        """
+        Count tokens in a LangChain BaseMessage object.
+        
+        This method is used by the CustomBufferWindowMemory class to count tokens
+        in individual messages for the token-based windowing functionality.
+        
+        Args:
+            message: A LangChain BaseMessage object (HumanMessage, AIMessage, etc.)
+            
+        Returns:
+            int: Number of tokens in the message content
+            
+        Raises:
+            ValueError: If message content cannot be encoded
+        """
+        try:
+            # Extract the content from the message
+            content = message.content
+            
+            # Handle different content types
+            if isinstance(content, str):
+                return len(self.encoding.encode(content))
+            elif isinstance(content, list):
+                # For multi-modal content, only count text parts
+                total = 0
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        total += len(self.encoding.encode(item.get("text", "")))
+                return total
+            else:
+                # For other types, convert to string and count
+                return len(self.encoding.encode(str(content)))
+        except Exception as e:
+            logger.error("Failed to count tokens in message", error=str(e))
+            # Return a safe default value instead of raising an exception
+            # This ensures the memory system continues to function
+            return 1  # Minimum token count to avoid division by zero
 
     def encode(self, text: str) -> List[int]:
         """Encode a single text string into tokens.
