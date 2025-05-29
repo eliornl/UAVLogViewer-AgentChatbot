@@ -21,7 +21,6 @@
 
 <script>
 import {
-    Ion,
     Color,
     ProviderViewModel,
     UrlTemplateImageryProvider,
@@ -84,8 +83,7 @@ import {
     isPointInPolygon
 } from './cesiumExtra/boundingPolygon.js'
 
-// Set Cesium token from environment variable
-Ion.defaultAccessToken = process.env.VUE_APP_CESIUM_TOKEN || ''
+// Cesium token is now set in main.js
 
 const colorCoderMode = new ColorCoderMode(store)
 const colorCoderRange = new ColorCoderRange(store)
@@ -781,7 +779,7 @@ export default {
             for (const pos of this.points) {
                 this.correctedTrajectory.push(Cartographic.fromDegrees(pos[0], pos[1], pos[2]))
             }
-            // process time_boot_ms into cesium time
+            // process time_boot_ms
             this.startTimeMs = getMinTime(this.points)
             const timespan = getMaxTime(this.points) - this.startTimeMs
             this.state.timeRange = [this.startTimeMs, this.startTimeMs + timespan]

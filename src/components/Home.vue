@@ -1,5 +1,16 @@
 <template>
     <div id='vuewrapper' style="height: 100%;">
+        <!-- Agentic Chat Interface - REMOVED from full-screen rendering here -->
+        <!--
+        <AgenticChat
+            v-if="state.agenticSessionActive"
+            :initial-session-id="state.agenticSessionId"
+            :initial-file-name="state.agenticFileName"
+            style="height: 100vh; width: 100%; position: absolute; top: 0; left: 0; z-index: 1000;"
+            @session-ended="handleAgenticSessionEnded"
+        />
+        -->
+
         <template v-if="state.mapLoading || state.plotLoading">
             <div id="waiting">
                 <atom-spinner
@@ -61,6 +72,7 @@ import { DjiDataExtractor } from '../tools/djiDataExtractor'
 import MagFitTool from '@/components/widgets/MagFitTool.vue'
 import EkfHelperTool from '@/components/widgets/EkfHelperTool.vue'
 import Vue from 'vue'
+// import AgenticChat from '@/components/AgenticChat.vue' // No longer used here
 
 export default {
     name: 'Home',
@@ -83,6 +95,8 @@ export default {
     },
     methods: {
         extractFlightData () {
+            if (this.state.agenticSessionActive) return // Don't process if chat is active
+
             if (this.dataExtractor === null) {
                 if (this.state.logType === 'tlog') {
                     this.dataExtractor = MavlinkDataExtractor
@@ -226,6 +240,14 @@ export default {
                 this.state.colors.push(new Color(rgba[0], rgba[1], rgba[2]))
                 // this.translucentColors.push(new Cesium.Color(rgba[0], rgba[1], rgba[2], 0.1))
             }
+        },
+        handleAgenticSessionEnded () {
+            // This might be repurposed or removed if the embedded chat handles its own closing differently
+            // For now, keep the core logic but it won't be triggered from a full-screen component.
+            this.state.agenticSessionId = null
+            this.state.agenticFileName = null
+            this.state.agenticSessionActive = false // This flag's role is changing
+            this.state.showEmbeddedChat = false // Ensure embedded chat is also hidden
         }
     },
     components: {
@@ -240,6 +262,7 @@ export default {
         AttitudeViewer,
         MagFitTool,
         EkfHelperTool
+        // AgenticChat // No longer used here
     },
     computed: {
         mapOk () {

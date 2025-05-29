@@ -4,3 +4,5 @@
 /src/tools/parsers/
 /*.js
 /test/unit/coverage/
+src/assets/mavlink.js
+src/libs/mavlink.js

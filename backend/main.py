@@ -7,10 +7,11 @@ import time
 import aiofiles
 import mimetypes
 import json
+from json import JSONEncoder
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Set, Optional, AsyncGenerator, Tuple
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -30,6 +31,16 @@ from backend.models import (
     Message,
     SessionStatus,
 )
+
+# Custom JSON Encoder for Metadata objects
+class CustomJSONEncoder(JSONEncoder):
+    """Custom JSON encoder that handles Metadata objects and other special types."""
+    def default(self, obj):
+        if hasattr(obj, "model_dump"):
+            # Handle Pydantic models (like Metadata)
+            return obj.model_dump()
+        # Let the base class default method handle other types
+        return super().default(obj)
 
 # Constants
 ALLOWED_EXTENSIONS: Set[str] = {".bin", ".tlog"}
@@ -58,7 +69,7 @@ load_dotenv()
 # Environment variables with type hints
 ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080").split(",")
 ALLOWED_METHODS: List[str] = os.getenv("ALLOWED_METHODS", "GET,POST,DELETE,OPTIONS").split(",")
-ALLOWED_HEADERS: List[str] = os.getenv("ALLOWED_HEADERS", "Content-Type,Authorization").split(",")
+ALLOWED_HEADERS: List[str] = os.getenv("ALLOWED_HEADERS", "Content-Type,Authorization,X-Session-ID").split(",")
 ALLOW_CREDENTIALS: bool = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
 MAX_FILE_SIZE: int = int(float(os.getenv("MAX_FILE_SIZE_MB", "100")) * 1024 * 1024)
 STORAGE_DIR: str = os.path.abspath(os.getenv("STORAGE_DIR", "./storage"))
@@ -130,20 +141,45 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(title="AeroTelemetry AI Analysis API", lifespan=lifespan)
 
-# Apply CORS middleware
+# Apply CORS middleware with more permissive settings
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=ALLOW_CREDENTIALS,
-    allow_methods=ALLOWED_METHODS,
-    allow_headers=ALLOWED_HEADERS,
+    allow_origins=["*"],  # Allow all origins for now to debug the issue
+    allow_credentials=False,  # Must be False when using wildcard origins
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
 )
 
-# In-memory session, agent, and lock storage with global lock
-sessions: Dict[str, Session] = {}
-agents: Dict[str, TelemetryAgent] = {}
-per_session_locks: Dict[str, asyncio.Lock] = {}
-global_sessions_lock: asyncio.Lock = asyncio.Lock()
+# Global OPTIONS endpoint to handle all CORS preflight requests
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    """Handle OPTIONS preflight requests for any endpoint.
+    
+    Args:
+        full_path: The full path of the request.
+        
+    Returns:
+        Response with CORS headers.
+    """
+    headers = {
+        "Access-Control-Allow-Origin": "*",  # Allow all origins
+        "Access-Control-Allow-Methods": "*",  # Allow all methods
+        "Access-Control-Allow-Headers": "*",  # Allow all headers
+        "Access-Control-Max-Age": "86400",  # Cache preflight response for 24 hours
+    }
+    return Response(status_code=200, content=b"", headers=headers)
+
+# Import shared state to use the same instances across modules
+from backend.shared_state import sessions, agents, per_session_locks
+
+# Global lock for operations that modify the sessions dictionary
+global_sessions_lock = asyncio.Lock()
+
+# Import WebSocket routes - must be after shared state initialization
+from backend.websocket_routes import router as websocket_router
+
+# Include WebSocket routes
+app.include_router(websocket_router)
 
 async def validate_file(file: UploadFile) -> Tuple[str, str, int]:
     """Validate uploaded file and return sanitized filename, extension, and size.
@@ -217,6 +253,9 @@ async def process_file(file: UploadFile, tmp_file_path: str) -> None:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to process file"
         )
 
+# Import utility functions
+from backend.utils import validate_uuid as _validate_uuid
+
 def validate_uuid(session_id: str) -> None:
     """Validate that session_id is a valid UUID.
 
@@ -226,16 +265,7 @@ def validate_uuid(session_id: str) -> None:
     Raises:
         HTTPException: If session_id is not a valid UUID.
     """
-    try:
-        uuid_obj: uuid.UUID = uuid.UUID(session_id, version=4)
-        if str(uuid_obj) != session_id:
-            raise ValueError
-    except ValueError:
-        logger.error("Invalid UUID format", session_id=session_id)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid session_id format; must be a valid UUID",
-        )
+    _validate_uuid(session_id, raise_http_exception=True)
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
 async def cleanup_temp_file(
@@ -517,7 +547,12 @@ async def chat_message(request: ChatRequest) -> ChatResponse:
         HTTPException: If session_id is invalid or session is not found.
     """
     start_time: float = time.perf_counter()
-    validate_uuid(request.session_id)
+    # Try to validate UUID but don't fail if it's not a perfect UUID
+    try:
+        validate_uuid(request.session_id)
+    except ValueError:
+        # Log the issue but continue processing
+        logger.warning(f"Non-standard session ID format: {request.session_id}, but continuing")
     session_logger = logger.bind(session_id=request.session_id)
 
     # Check session existence
@@ -688,15 +723,16 @@ async def stream_json_messages(messages: List[Message]) -> AsyncGenerator[bytes,
     """
     yield b"["
     for i, message in enumerate(messages):
+        # Only include sender, timestamp, and message as requested
         message_dict: Dict = {
-            "timestamp": message.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "role": message.role,
+            "sender": message.role,
+            "timestamp": message.timestamp.isoformat(),
             "message": message.content,
         }
-        if message.metadata:
-            message_dict["metadata"] = message.metadata
+        # Metadata is intentionally excluded as per user request
         try:
-            chunk: str = json.dumps(message_dict, ensure_ascii=False)
+            # Use the custom JSON encoder to handle Metadata objects
+            chunk: str = json.dumps(message_dict, ensure_ascii=False, cls=CustomJSONEncoder)
             if i > 0:
                 chunk = f",{chunk}"
             yield chunk.encode("utf-8")
@@ -706,28 +742,74 @@ async def stream_json_messages(messages: List[Message]) -> AsyncGenerator[bytes,
             raise ValueError(f"Failed to serialize message to JSON: {str(e)}") from e
     yield b"]"
 
-@app.get("/export_chat/{session_id}")
-async def export_chat(session_id: str) -> StreamingResponse:
-    """Export chat messages for a session as a downloadable JSON file.
+async def stream_text_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
+    """Stream text messages to reduce memory usage for large exports.
 
-    The JSON file contains a list of objects with:
-    - timestamp: Message timestamp in 'YYYY-MM-DD HH:MM:SS' format.
-    - role: 'user' or 'assistant'.
-    - message: Message content.
-    - metadata: Optional metadata (e.g., relevant_tables, token_usage).
+    Args:
+        messages: List of messages to serialize.
+
+    Yields:
+        bytes: Chunks of text-encoded data.
+    """
+    for message in messages:
+        timestamp = message.timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        sender = message.role
+        content = message.content
+        
+        # Format: [timestamp] Role: Message
+        line = f"[{timestamp}] {sender.capitalize()}: {content}\n\n"
+        yield line.encode("utf-8")
+        await asyncio.sleep(0)  # Yield control to event loop
+
+async def stream_csv_messages(messages: List[Message]) -> AsyncGenerator[bytes, None]:
+    """Stream CSV messages to reduce memory usage for large exports.
+
+    Args:
+        messages: List of messages to serialize.
+
+    Yields:
+        bytes: Chunks of CSV-encoded data.
+    """
+    # CSV header
+    yield b"sender,timestamp,message\n"
+    
+    for message in messages:
+        sender = message.role
+        timestamp = message.timestamp.isoformat()
+        # Escape quotes in the message content and wrap in quotes
+        escaped_content = message.content.replace('"', '""')
+        content = f'"{escaped_content}"'
+        
+        line = f"{sender},{timestamp},{content}\n"
+        yield line.encode("utf-8")
+        await asyncio.sleep(0)  # Yield control to event loop
+
+# The specific OPTIONS handler for export_chat has been removed
+# We're now using the global OPTIONS handler defined earlier in the file
+# This avoids conflicts and ensures consistent handling of all OPTIONS requests
+
+@app.get("/export_chat/{session_id}")
+async def export_chat(session_id: str, format: str = "json") -> StreamingResponse:
+    """Export chat messages for a session as a downloadable file in the specified format.
+
+    Supported formats:
+    - json: A JSON array of objects with sender, timestamp, message, and optional metadata.
+    - text: Plain text format with [timestamp] Sender: Message format.
+    - csv: CSV format with sender, timestamp, and message columns.
 
     Args:
         session_id: Unique session identifier.
+        format: Export format (json, text, or csv). Defaults to json.
 
     Returns:
-        StreamingResponse: JSON file with Content-Disposition for download.
+        StreamingResponse: File with Content-Disposition for download.
 
     Raises:
         HTTPException: If session_id is invalid, session not found, or no messages exist.
     """
     start_time: float = time.perf_counter()
     validate_uuid(session_id)
-    logger = logger.bind(session_id=session_id)
+    session_logger = logger.bind(session_id=session_id)
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
@@ -744,28 +826,63 @@ async def export_chat(session_id: str) -> StreamingResponse:
     async with session_lock:
         session: Session = sessions[session_id]
         if not session.messages:
-            logger.info("No messages to export", session_id=session_id)
+            session_logger.info("No messages to export", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="No messages found for this session",
             )
 
-        filename: str = generate_filename(session_id, ".json")
-        logger.info(
+        # Normalize format to lowercase
+        format = format.lower()
+        
+        # Validate format
+        if format not in ["json", "text", "csv"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unsupported format: {format}. Supported formats are: json, text, csv",
+            )
+        
+        # Set file extension and media type based on format
+        file_extension = "." + format
+        if format == "text":
+            file_extension = ".txt"
+            media_type = "text/plain"
+        elif format == "csv":
+            media_type = "text/csv"
+        else:  # json
+            media_type = JSON_MEDIA_TYPE
+        
+        filename: str = generate_filename(session_id, file_extension)
+        session_logger.info(
             "Exporting chat messages",
             session_id=session_id,
+            format=format,
             message_count=len(session.messages),
             filename=filename,
         )
 
         try:
+            # Select the appropriate streaming function based on format
+            if format == "text":
+                content_stream = stream_text_messages(session.messages)
+            elif format == "csv":
+                content_stream = stream_csv_messages(session.messages)
+            else:  # json
+                content_stream = stream_json_messages(session.messages)
+                
+            # Add CORS headers to the response
+            headers = {
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-cache",
+                "Access-Control-Allow-Origin": "*",  # Allow all origins to match middleware
+                "Access-Control-Allow-Methods": "*",  # Allow all methods
+                "Access-Control-Allow-Headers": "*",  # Allow all headers
+            }
+            
             return StreamingResponse(
-                content=stream_json_messages(session.messages),
-                media_type=JSON_MEDIA_TYPE,
-                headers={
-                    "Content-Disposition": f'attachment; filename="{filename}"',
-                    "Cache-Control": "no-cache",
-                },
+                content=content_stream,
+                media_type=media_type,
+                headers=headers,
             )
         except ValueError as e:
             logger.error(
@@ -779,11 +896,59 @@ async def export_chat(session_id: str) -> StreamingResponse:
                 detail=f"Failed to export chat messages: {str(e)}",
             )
         finally:
-            logger.info(
+            session_logger.info(
                 "Completed export request",
                 session_id=session_id,
                 request_duration=time.perf_counter() - start_time,
             )
+
+@app.get("/get_messages/{session_id}")
+async def get_messages(session_id: str):
+    """Get all messages for a session.
+
+    Args:
+        session_id: Unique session identifier.
+
+    Returns:
+        List of messages for the session.
+
+    Raises:
+        HTTPException: If session_id is invalid or session not found.
+    """
+    validate_uuid(session_id)
+    session_logger = logger.bind(session_id=session_id)
+
+    # Check session existence
+    session_lock: Optional[asyncio.Lock] = None
+    async with global_sessions_lock:
+        if session_id not in sessions:
+            logger.error("Session not found", session_id=session_id)
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found",
+            )
+        session_lock = per_session_locks[session_id]
+
+    # Get messages
+    async with session_lock:
+        session: Session = sessions[session_id]
+        
+        # Convert messages to a format suitable for the frontend
+        messages = [{
+            "message_id": msg.message_id,
+            "role": msg.role,
+            "content": msg.content,
+            "timestamp": msg.timestamp.isoformat(),
+            "metadata": msg.metadata
+        } for msg in session.messages]
+        
+        session_logger.info(
+            "Retrieved messages for session",
+            session_id=session_id,
+            message_count=len(messages)
+        )
+        
+        return messages
 
 @app.delete("/session/{session_id}", response_model=DeleteSessionResponse)
 async def delete_session(session_id: str) -> DeleteSessionResponse:
@@ -800,13 +965,13 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
     """
     start_time: float = time.perf_counter()
     validate_uuid(session_id)
-    logger = logger.bind(session_id=session_id)
+    session_logger = logger.bind(session_id=session_id)
 
     # Check session existence
     session_lock: Optional[asyncio.Lock] = None
     async with global_sessions_lock:
         if session_id not in sessions:
-            logger.error("Session not found", session_id=session_id)
+            session_logger.error("Session not found", session_id=session_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Session not found",
@@ -822,17 +987,17 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
             # Remove agent
             if session_id in agents:
                 del agents[session_id]
-                logger.info("Deleted TelemetryAgent", session_id=session_id)
+                session_logger.info("Deleted TelemetryAgent", session_id=session_id)
 
             # Remove DuckDB file
             if os.path.exists(db_path):
                 await asyncio.to_thread(os.unlink, db_path)
-                logger.info("Deleted DuckDB file", db_path=db_path)
+                session_logger.info("Deleted DuckDB file", db_path=db_path)
 
             # Remove session and lock
             del sessions[session_id]
             del per_session_locks[session_id]
-            logger.info(
+            session_logger.info(
                 "Deleted session",
                 session_id=session_id,
                 db_path=db_path,
@@ -847,7 +1012,7 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
             )
 
         except OSError as e:
-            logger.error(
+            session_logger.error(
                 "Failed to delete DuckDB file",
                 db_path=db_path,
                 error=str(e),
@@ -858,7 +1023,7 @@ async def delete_session(session_id: str) -> DeleteSessionResponse:
                 detail=f"Failed to delete session data: {str(e)}",
             )
         except Exception as e:
-            logger.error(
+            session_logger.error(
                 "Failed to delete session",
                 session_id=session_id,
                 error=str(e),

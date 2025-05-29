@@ -17,6 +17,8 @@ MAX_MESSAGES: int = 1000  # Max messages per session
 MAX_METADATA_SIZE: int = 100  # Max key-value pairs in metadata
 MAX_TOKEN_SAFETY_LIMIT: int = 16384  # From telemetry_agent.py
 ID_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_]+$")  # Alphanumeric, hyphens, underscores
+# UUID pattern for session IDs and message IDs
+UUID_PATTERN: re.Pattern = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # UUID format
 FILE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_\.]+$")  # Alphanumeric, hyphens, underscores, dots
 ROLE_TYPES: tuple[str, ...] = ("user", "assistant")
 
@@ -397,8 +399,11 @@ class ChatRequest(BaseModel):
         """Ensure message_id is valid if provided."""
         if v is None:
             return None
-        if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores")
+        if not v:
+            raise ValueError("Message ID cannot be empty")
+        # Accept standard ID pattern, UUID pattern, or numeric timestamp
+        if not (ID_PATTERN.match(v) or UUID_PATTERN.match(v) or v.isdigit()):
+            raise ValueError(f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores, a UUID, or a numeric timestamp")
         return v
 
 class ChatResponse(BaseModel):

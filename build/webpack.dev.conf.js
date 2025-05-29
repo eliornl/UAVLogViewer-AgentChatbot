@@ -27,6 +27,12 @@ const devWebpackConfig = merge(baseWebpackConfig, {
   module: {
     rules: utils.styleLoaders({ sourceMap: config.dev.cssSourceMap, usePostCSS: true })
   },
+  resolve: {
+    fallback: {
+      "vm": require.resolve("vm-browserify"),
+      "path": require.resolve("path-browserify")
+    }
+  },
   // cheap-module-eval-source-map is faster for development
   devtool: config.dev.devtool,
 
@@ -36,9 +42,7 @@ const devWebpackConfig = merge(baseWebpackConfig, {
   // these devServer options should be customized in /config/index.js
   devServer: {
     client: {
-      overlay: config.dev.errorOverlay
-        ? { warnings: false, errors: true }
-        : false,
+      overlay: false,
         logging: 'warn',
 
     },

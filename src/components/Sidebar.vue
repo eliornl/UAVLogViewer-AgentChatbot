@@ -13,31 +13,57 @@
             <span v-if="state.file" class="filename">Current file: {{state.file}}</span>
             <div class="tabholder">
                 <!-- Home -->
-                <a :class="selected === 'home' ? 'selected' : ''" @click="selected='home'" v-if="!state.processDone">
-                <i class="fas fa-home"></i>Home</a>
+                <a :class="{ selected: selected === 'home' }"
+                   @click="selected='home'; state.showEmbeddedChat = false;"
+                   v-if="!state.processDone">
+                    <i class="fas fa-home"></i>Home
+                </a>
                 <!-- Plot -->
-                <a :class="selected === 'plot' ? 'selected' : ''" @click="selected='plot'"
-                   v-if="state.processDone"> <i class="fas fa-chart-line"></i>Plot</a>
+                <a :class="{ selected: selected === 'plot' }"
+                   @click="selected='plot'; state.showEmbeddedChat = false;"
+                   v-if="state.processDone">
+                    <i class="fas fa-chart-line"></i>Plot
+                </a>
+                <!-- Chat Button -->
+                <a :class="{ selected: selected === 'chat' }"
+                   @click="toggleAgenticChatPanel"
+                   v-if="state.processDone && state.currentLogInitialSessionId">
+                    <i :class="state.showEmbeddedChat ? 'fas fa-times-circle' : 'fas fa-comments'"></i>
+                    {{ state.showEmbeddedChat ? 'Close Chat' : 'Chat' }}
+                </a>
                 <!-- more -->
-                <a :class="selected ==='other' ? 'selected' : ''" @click="selected='other'" v-if="state.processDone">
+                <a :class="{ selected: selected === 'other' }"
+                   @click="selected='other'; state.showEmbeddedChat = false;"
+                   v-if="state.processDone">
                     <i class="fas fa-ellipsis-v"></i>
                 </a>
             </div>
+
+            <!-- Embedded Agentic Chat Panel -->
+            <div v-if="state.showEmbeddedChat && state.currentLogInitialSessionId"
+                 class="embedded-chat-panel">
+                <AgenticChat
+                    :initial-session-id="state.agenticSessionId"
+                    :initial-file-name="state.agenticFileName"
+                    @session-ended="handleEmbeddedChatSessionEnded"
+                />
+            </div>
+
         </b-collapse>
         <!-- TOGGLE MENU -->
         <div class="menu-list">
             <b-collapse class="menu-content collapse out" id="menucontent" visible>
 
-                <div :style="{display: selected==='plot' ? '' : 'none' }">
+                <div :style="{display: selected==='plot' && !state.showEmbeddedChat ? '' : 'none' }">
                     <plotSetup/>
                     <message-menu/>
                 </div>
-                <div v-if="selected==='home'">
+                <div v-if="selected==='home' && !state.showEmbeddedChat">
                     <Dropzone/>
                     <span class="buildinfo">Commit {{state.commit}}</span>
                     <span class="buildinfo">Built {{state.buildDate}}</span>
                 </div>
-                <div v-if="selected==='other'">
+                <div v-if="selected==='other' && !state.showEmbeddedChat">
                     <!-- PARAM/MESSAGES/RADIO -->
                     <hr>
                     <a class="centered-section"> Show / hide </a>
@@ -133,9 +159,11 @@ import Dropzone from './SideBarFileManager.vue'
 import MessageMenu from './SideBarMessageMenu.vue'
 import {store} from './Globals.js'
 import PlotSetup from './PlotSetup.vue'
+import AgenticChat from './AgenticChat.vue';
 
 export default {
     name: 'sidebar',
+    components: {PlotSetup, MessageMenu, Dropzone, AgenticChat},
     data () {
         return {
             selected: 'home',
@@ -151,9 +179,34 @@ export default {
     },
     methods: {
         setSelected (selected) {
-            this.selected = selected
+            this.selected = selected;
+            if (selected !== 'chat') {
+                this.state.showEmbeddedChat = false;
+            }
         },
-
+        toggleAgenticChatPanel () {
+            if (!this.state.currentLogInitialSessionId) {
+                console.warn('No current log session ID available to toggle agentic chat panel.');
+                this.state.showEmbeddedChat = false;
+                return;
+            }
+            this.state.showEmbeddedChat = !this.state.showEmbeddedChat;
+            if (this.state.showEmbeddedChat) {
+                this.state.agenticSessionId = this.state.currentLogInitialSessionId;
+                this.state.agenticFileName = this.state.currentLogInitialFileName || 'log file';
+                this.selected = 'chat';
+            } else {
+                if (this.selected === 'chat') {
+                    this.selected = this.state.processDone ? 'plot' : 'home';
+                }
+            }
+        },
+        handleEmbeddedChatSessionEnded() {
+            this.state.showEmbeddedChat = false;
+            if (this.selected === 'chat') {
+                this.selected = this.state.processDone ? 'plot' : 'home';
+            }
+        },
         startCapture (displayMediaOptions) {
             navigator.mediaDevices.getDisplayMedia({video: { mediaSource: 'screen' }})
                 .then((stream) => {
@@ -224,8 +277,7 @@ export default {
         blob () {
             this.downloadURL = URL.createObjectURL(this.blob)
         }
-    },
-    components: {PlotSetup, MessageMenu, Dropzone}
+    }
 }
 </script>
 <style scoped>
@@ -591,5 +643,16 @@ a.centered-section {
         border-left: none;
         margin-left: 40%;
 
+    }
+
+    .embedded-chat-panel {
+        height: 670px;
+        overflow-y: hidden;
+        border-top: 1px solid #ccc;
+        margin-top: 10px;
+    }
+
+    .tabholder a {
+        cursor: pointer;
     }
 </style>

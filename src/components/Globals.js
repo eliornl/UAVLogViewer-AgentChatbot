@@ -64,5 +64,20 @@ export const store = {
     commit: _COMMIT_.slice(0, 6),
     /* global _BUILDDATE_ */
     buildDate: _BUILDDATE_,
-    childPlots: []
+    childPlots: [],
+    // Agentic Chat State
+    agenticSessionId: null,
+    agenticFileName: null,
+    agenticSessionActive: false,
+    isUploadingAgenticLog: false,
+    agenticUploadError: null,
+    showAgenticChatUpload: true, // Initially true to show upload prompt
+    currentLogInitialSessionId: null, // New: Stores session_id from latest upload
+    currentLogInitialFileName: null, // New: Stores filename from latest upload
+    showEmbeddedChat: false, // New: Controls visibility of chat panel in sidebar
+    isLoadingAgenticLog: false
+}
+
+export const config = {
+    // ... existing code ...
 }

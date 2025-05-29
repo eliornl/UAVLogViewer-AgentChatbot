@@ -11,16 +11,17 @@ module.exports = {
     assetsSubDirectory: 'static',
     assetsPublicPath: '/',
     proxyTable: {
-    "/upload/*":{
-        target:"http://localhost:8001/upload",
+      "/api/upload": {
+        target: "http://localhost:8000",
+        pathRewrite: {"^/api/upload" : "/upload"},
+        secure: "false"
+      },
+      "/eniro/*":{
+        target:"http://localhost:8000/eniro",
         secure:"false"
-    },
-    "/eniro/*":{
-        target:"http://localhost:8001/eniro",
-        secure:"false"
-    },
+      },
       "/uploaded/*":{
-        target:"http://localhost:8001/uploaded",
+        target:"http://localhost:8000/uploaded",
         secure:"false"
       },
     },
