@@ -9,12 +9,12 @@ provides a formatted history for the agent to reference.
 import json
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Tuple, Union
 import structlog
 from langchain_core.agents import AgentAction, AgentFinish
 
 # Constants for scratchpad management
-MAX_SCRATCHPAD_STEPS = 5  # Maximum number of steps to keep in the scratchpad
+MAX_SCRATCHPAD_STEPS = 3  # Maximum number of steps to keep in the scratchpad
 MAX_OBSERVATION_STORAGE_LENGTH = 5000  # Maximum length of observation to store in full
 MAX_OBSERVATION_SNIPPET_LENGTH = (
     100  # Maximum length of observation snippet for logging
@@ -377,8 +377,8 @@ class AgentScratchpad:
 
         # If we have too many steps, convert older ones to ultra-compact summaries
         if len(self.intermediate_steps) > MAX_SCRATCHPAD_STEPS:
-            # Keep the most recent steps intact, summarize older ones
-            keep_recent = 10  # Keep the 10 most recent steps intact
+            # Keep only the MAX_SCRATCHPAD_STEPS most recent steps
+            keep_recent = MAX_SCRATCHPAD_STEPS
             steps_to_summarize = len(self.intermediate_steps) - keep_recent
 
             if steps_to_summarize > 0:

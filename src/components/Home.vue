@@ -389,7 +389,6 @@ export default {
     .nav-side-menu li :not(collapsed) .arrow:before {
         font-family: 'Montserrat', sans-serif;
         content: "\f078";
-        display: inline-block;
         padding-left: 10px;
         padding-right: 10px;
         vertical-align: middle;

@@ -90,6 +90,7 @@ STORAGE_DIR: str = os.path.abspath(os.getenv("STORAGE_DIR", "./storage"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
 LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
+MAX_MODEL_TOKENS: int = int(os.getenv("MAX_MODEL_TOKENS", 8192))
 
 # These constants are now defined at the top of the file
 
@@ -1067,8 +1068,7 @@ async def get_messages(session_id: str) -> List[Dict[str, Any]]:
         return messages
 
 
-@app.delete("/session/{session_id}", response_model=DeleteSessionResponse)
-@app.post("/session/{session_id}/delete", response_model=DeleteSessionResponse)  # Explicit delete endpoint for beacon
+@app.post("/session/{session_id}/delete", response_model=DeleteSessionResponse)  # Endpoint for session deletion via beacon
 async def delete_session(session_id: str) -> DeleteSessionResponse:
     """Delete a session, its agent, and associated DuckDB file.
 
