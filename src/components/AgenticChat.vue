@@ -237,6 +237,13 @@ export default {
     },
     beforeDestroy () {
         this.disconnectWebSocket()
+        // Don't delete the session here - this is called when the chat component is destroyed
+        // which happens when closing the chat panel, not when navigating away from the app
+    },
+
+    mounted () {
+        // We don't want to register the beforeunload handler here
+        // The parent component will handle session deletion on navigation/browser close
     },
     methods: {
     /**

@@ -215,6 +215,10 @@ export default {
                             this.state.currentLogInitialSessionId = responseData.session_id
                             this.state.currentLogInitialFileName = responseData.filename || this.file.name
 
+                            // Debug session tracking
+                            console.log(`[SideBarFileManager] Session created and stored: ${responseData.session_id}`)
+                            localStorage.setItem('currentSessionId', responseData.session_id)
+
                             this.showAgenticChoice = true // Show choice buttons
                             this.transferMessage = 'Upload complete. Choose an option.'
                             // Do not automatically start agentic chat here

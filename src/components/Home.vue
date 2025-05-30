@@ -83,14 +83,31 @@ export default {
         this.state.timeAttitudeQ = []
         this.state.currentTrajectory = []
         isOnline().then(a => { this.state.isOnline = a })
+
+        // Add event listener for router navigation
+        this.$router.beforeEach((to, from, next) => {
+            // If navigating to home page from another page and we have an active session
+            if (to.name === 'Home' && from.name !== 'Home' && this.state.currentLogInitialSessionId) {
+                this.cleanupSession()
+            }
+            next()
+        })
+
+        // Add event listeners for browser close/refresh
+        window.addEventListener('beforeunload', this.handleBeforeUnload)
+        window.addEventListener('unload', this.handleUnload)
     },
     beforeDestroy () {
         this.$eventHub.$off('messages')
+        // Remove event listeners for browser close/refresh
+        window.removeEventListener('beforeunload', this.handleBeforeUnload)
+        window.removeEventListener('unload', this.handleUnload)
     },
     data () {
         return {
             state: store,
-            dataExtractor: null
+            dataExtractor: null,
+            backendUrl: 'http://localhost:8000' // Backend URL for API calls
         }
     },
     methods: {
@@ -248,6 +265,83 @@ export default {
             this.state.agenticFileName = null
             this.state.agenticSessionActive = false // This flag's role is changing
             this.state.showEmbeddedChat = false // Ensure embedded chat is also hidden
+        },
+
+        /**
+         * Handles the beforeunload event when the browser is closed or refreshed
+         * @param {Event} event - The beforeunload event
+         */
+        handleBeforeUnload (event) {
+            // In beforeunload, just log that we're about to unload
+            // We'll do the actual cleanup in the unload handler
+            if (this.state.currentLogInitialSessionId) {
+                const sessionId = this.state.currentLogInitialSessionId
+                console.log(`[Home] beforeunload triggered for session: ${sessionId}`)
+
+                // Store session ID in localStorage as a backup
+                localStorage.setItem('sessionToDelete', sessionId)
+
+                // Some browsers require returnValue to be set to show a confirmation dialog
+                // but we don't actually need to prevent navigation
+                // event.returnValue = ''
+            }
+        },
+
+        /**
+         * Handles the unload event when the browser is actually closing or navigating away
+         * This is our last chance to clean up
+         */
+        handleUnload (event) {
+            // Try to get session ID from state or localStorage
+            const sessionId = this.state.currentLogInitialSessionId || localStorage.getItem('sessionToDelete')
+
+            if (sessionId) {
+                console.log(`[Home] unload triggered, cleaning up session: ${sessionId}`)
+
+                // Use sendBeacon for more reliable delivery during page unload
+                if (navigator.sendBeacon) {
+                    // Use the explicit delete endpoint for better logging clarity
+                    const url = `${this.backendUrl}/session/${sessionId}/delete`
+                    navigator.sendBeacon(url, JSON.stringify({}))
+                    console.log(`[Home] Sent beacon to delete session: ${sessionId}`)
+
+                    // Clear localStorage
+                    localStorage.removeItem('sessionToDelete')
+                }
+            }
+        },
+
+        /**
+         * Cleans up the current session by calling the delete_session API
+         */
+        cleanupSession () {
+            const sessionId = this.state.currentLogInitialSessionId
+            if (!sessionId) return
+
+            console.log(`[Home] Cleaning up session: ${sessionId}`)
+
+            // Call the backend API to delete the session
+            fetch(`${this.backendUrl}/session/${sessionId}`, {
+                method: 'DELETE',
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            })
+                .then(response => {
+                    if (response.ok) {
+                        console.log(`[Home] Successfully deleted session: ${sessionId}`)
+                    } else {
+                        console.error(`[Home] Failed to delete session: ${sessionId}`, response.statusText)
+                    }
+                })
+                .catch(error => {
+                    console.error(`[Home] Error deleting session: ${sessionId}`, error)
+                })
+                .finally(() => {
+                // Clear the session ID regardless of success/failure
+                    this.state.currentLogInitialSessionId = null
+                    this.state.currentLogInitialFileName = null
+                })
         }
     },
     components: {

@@ -1068,6 +1068,7 @@ async def get_messages(session_id: str) -> List[Dict[str, Any]]:
 
 
 @app.delete("/session/{session_id}", response_model=DeleteSessionResponse)
+@app.post("/session/{session_id}/delete", response_model=DeleteSessionResponse)  # Explicit delete endpoint for beacon
 async def delete_session(session_id: str) -> DeleteSessionResponse:
     """Delete a session, its agent, and associated DuckDB file.
 
