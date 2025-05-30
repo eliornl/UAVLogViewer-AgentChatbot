@@ -5,6 +5,7 @@ import structlog
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
+
 class LLMTokenCounter:
     """Handles token counting for text inputs using tiktoken for LLM models.
 
@@ -26,7 +27,9 @@ class LLMTokenCounter:
             self.encoding = tiktoken.encoding_for_model(model_name)
             logger.debug("Initialized LLMTokenCounter", model_name=model_name)
         except KeyError as e:
-            logger.error("Invalid model name provided", model_name=model_name, error=str(e))
+            logger.error(
+                "Invalid model name provided", model_name=model_name, error=str(e)
+            )
             raise ValueError(f"Unsupported model name: {model_name}") from e
 
     def count_tokens(self, messages: List[Tuple[str, str]]) -> int:
@@ -55,9 +58,11 @@ class LLMTokenCounter:
                     "Invalid message format at index",
                     index=index,
                     expected="tuple[str, str]",
-                    got=type(message).__name__
+                    got=type(message).__name__,
                 )
-                raise ValueError(f"Message at index {index} must be a tuple of two strings")
+                raise ValueError(
+                    f"Message at index {index} must be a tuple of two strings"
+                )
 
             user_content, assistant_content = message
 
@@ -67,7 +72,7 @@ class LLMTokenCounter:
                     "Invalid user content type at index",
                     index=index,
                     expected="str",
-                    got=type(user_content).__name__
+                    got=type(user_content).__name__,
                 )
                 raise TypeError(f"User content at index {index} must be a string")
 
@@ -77,7 +82,7 @@ class LLMTokenCounter:
                     "Invalid assistant content type at index",
                     index=index,
                     expected="str",
-                    got=type(assistant_content).__name__
+                    got=type(assistant_content).__name__,
                 )
                 raise TypeError(f"Assistant content at index {index} must be a string")
 
@@ -89,9 +94,11 @@ class LLMTokenCounter:
                     logger.error(
                         "Failed to encode user content at index",
                         index=index,
-                        error=str(e)
+                        error=str(e),
                     )
-                    raise ValueError(f"Failed to encode user content at index {index}: {str(e)}") from e
+                    raise ValueError(
+                        f"Failed to encode user content at index {index}: {str(e)}"
+                    ) from e
 
             # Count tokens for assistant content
             if assistant_content:
@@ -101,38 +108,40 @@ class LLMTokenCounter:
                     logger.error(
                         "Failed to encode assistant content at index",
                         index=index,
-                        error=str(e)
+                        error=str(e),
                     )
-                    raise ValueError(f"Failed to encode assistant content at index {index}: {str(e)}") from e
+                    raise ValueError(
+                        f"Failed to encode assistant content at index {index}: {str(e)}"
+                    ) from e
 
         logger.debug(
             "Counted tokens for messages",
             model_name=self.model_name,
             message_count=len(messages),
-            total_tokens=total_tokens
+            total_tokens=total_tokens,
         )
         return total_tokens
-        
+
     def count_message_tokens(self, message: BaseMessage) -> int:
         """
         Count tokens in a LangChain BaseMessage object.
-        
+
         This method is used by the CustomBufferWindowMemory class to count tokens
         in individual messages for the token-based windowing functionality.
-        
+
         Args:
             message: A LangChain BaseMessage object (HumanMessage, AIMessage, etc.)
-            
+
         Returns:
             int: Number of tokens in the message content
-            
+
         Raises:
             ValueError: If message content cannot be encoded
         """
         try:
             # Extract the content from the message
             content = message.content
-            
+
             # Handle different content types
             if isinstance(content, str):
                 return len(self.encoding.encode(content))
@@ -171,8 +180,12 @@ class LLMTokenCounter:
 
         try:
             tokens = self.encoding.encode(text)
-            logger.debug("Encoded text", model_name=self.model_name, token_count=len(tokens))
+            logger.debug(
+                "Encoded text", model_name=self.model_name, token_count=len(tokens)
+            )
             return tokens
         except Exception as e:
-            logger.error("Failed to encode text", model_name=self.model_name, error=str(e))
+            logger.error(
+                "Failed to encode text", model_name=self.model_name, error=str(e)
+            )
             raise ValueError(f"Failed to encode text: {str(e)}") from e

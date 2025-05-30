@@ -24,53 +24,77 @@ MAX_RELEVANT_TABLES: int = 50  # Maximum number of relevant tables in metadata
 MAX_QUERY_LENGTH: int = 1000  # Maximum SQL query length in metadata
 
 # Regex patterns for validation
-ID_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_]+$")  # Alphanumeric, hyphens, underscores
-UUID_PATTERN: re.Pattern = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")  # UUID format
-FILE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9\-_\.]+$")  # Alphanumeric, hyphens, underscores, dots
-TABLE_NAME_PATTERN: re.Pattern = re.compile(r"^[a-zA-Z0-9_]+$")  # Valid SQL table name pattern
+ID_PATTERN: re.Pattern = re.compile(
+    r"^[a-zA-Z0-9\-_]+$"
+)  # Alphanumeric, hyphens, underscores
+UUID_PATTERN: re.Pattern = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)  # UUID format
+FILE_NAME_PATTERN: re.Pattern = re.compile(
+    r"^[a-zA-Z0-9\-_\.]+$"
+)  # Alphanumeric, hyphens, underscores, dots
+TABLE_NAME_PATTERN: re.Pattern = re.compile(
+    r"^[a-zA-Z0-9_]+$"
+)  # Valid SQL table name pattern
 
 # Type constants
 ROLE_TYPES: tuple[str, ...] = ("user", "assistant")
 TOKEN_USAGE_KEYS: set[str] = {"prompt_tokens", "completion_tokens", "total_tokens"}
 
+
 class ResponseStatus(str, Enum):
     """Status codes for API responses."""
+
     SUCCESS = "SUCCESS"
     ERROR = "ERROR"
 
+
 class SessionStatus(str, Enum):
     """Status codes for session processing state."""
+
     PENDING = "PENDING"
     READY = "READY"
     ERROR = "ERROR"
 
+
 class Metadata(BaseModel):
     """Structured metadata for messages and responses."""
+
     model_config = ConfigDict(extra="allow")  # Allow extra fields for flexibility
-    relevant_tables: Optional[List[str]] = Field(default=None, description="List of relevant telemetry tables")
+    relevant_tables: Optional[List[str]] = Field(
+        default=None, description="List of relevant telemetry tables"
+    )
     query: Optional[str] = Field(default=None, description="SQL query executed, if any")
-    token_usage: Optional[Dict[str, int]] = Field(default=None, description="Token usage statistics")
-    memory_strategy: Optional[str] = Field(default=None, description="Memory strategy used")
-    is_clarification: Optional[bool] = Field(default=None, description="Whether response requests clarification")
+    token_usage: Optional[Dict[str, int]] = Field(
+        default=None, description="Token usage statistics"
+    )
+    memory_strategy: Optional[str] = Field(
+        default=None, description="Memory strategy used"
+    )
+    is_clarification: Optional[bool] = Field(
+        default=None, description="Whether response requests clarification"
+    )
 
     @field_validator("relevant_tables", mode="before")
     @classmethod
     def validate_relevant_tables(cls, v: Optional[List[str]]) -> Optional[List[str]]:
         """Ensure relevant_tables contains valid table names.
-        
+
         Args:
             v: List of table names to validate or None
-            
+
         Returns:
             The validated list of table names or None
-            
+
         Raises:
             ValueError: If too many tables or invalid table names are provided
         """
         if v is None:
             return None
         if len(v) > MAX_RELEVANT_TABLES:
-            raise ValueError(f"Too many relevant tables, maximum is {MAX_RELEVANT_TABLES}")
+            raise ValueError(
+                f"Too many relevant tables, maximum is {MAX_RELEVANT_TABLES}"
+            )
         for table in v:
             if not table or len(table) > 100 or not TABLE_NAME_PATTERN.match(table):
                 raise ValueError(f"Invalid table name: {table}")
@@ -80,33 +104,37 @@ class Metadata(BaseModel):
     @classmethod
     def validate_query(cls, v: Optional[str]) -> Optional[str]:
         """Ensure query is a valid SQL string.
-        
+
         Args:
             v: SQL query string to validate or None
-            
+
         Returns:
             The validated SQL query string or None
-            
+
         Raises:
             ValueError: If the query exceeds the maximum length
         """
         if v is None:
             return None
         if len(v) > MAX_QUERY_LENGTH:
-            raise ValueError(f"SQL query too long, maximum length is {MAX_QUERY_LENGTH} characters")
+            raise ValueError(
+                f"SQL query too long, maximum length is {MAX_QUERY_LENGTH} characters"
+            )
         return v
 
     @field_validator("token_usage", mode="before")
     @classmethod
-    def validate_token_usage(cls, v: Optional[Dict[str, int]]) -> Optional[Dict[str, int]]:
+    def validate_token_usage(
+        cls, v: Optional[Dict[str, int]]
+    ) -> Optional[Dict[str, int]]:
         """Ensure token_usage contains valid keys and values.
-        
+
         Args:
             v: Dictionary of token usage statistics or None
-            
+
         Returns:
             The validated token usage dictionary or None
-            
+
         Raises:
             ValueError: If invalid keys or non-integer values are provided
         """
@@ -117,6 +145,7 @@ class Metadata(BaseModel):
         if any(not isinstance(val, int) or val < 0 for val in v.values()):
             raise ValueError("token_usage values must be non-negative integers")
         return v
+
 
 class Message(BaseModel):
     """Chat message details for a session.
@@ -134,29 +163,25 @@ class Message(BaseModel):
     Raises:
         ValueError: If message_id, role, content, or timestamp are invalid.
     """
-    model_config = ConfigDict(str_strip_whitespace=True)  # Strip whitespace from strings
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True
+    )  # Strip whitespace from strings
     message_id: str = Field(
         ...,
         description="Unique message identifier (e.g., UUID)",
-        max_length=MAX_ID_LENGTH
+        max_length=MAX_ID_LENGTH,
     )
     role: Literal["user", "assistant"] = Field(
-        ...,
-        description="Role of the message sender ('user' or 'assistant')"
+        ..., description="Role of the message sender ('user' or 'assistant')"
     )
     content: str = Field(
-        ...,
-        description="Message content",
-        max_length=MAX_CONTENT_LENGTH,
-        min_length=1
+        ..., description="Message content", max_length=MAX_CONTENT_LENGTH, min_length=1
     )
-    timestamp: datetime = Field(
-        ...,
-        description="Message creation timestamp in UTC"
-    )
+    timestamp: datetime = Field(..., description="Message creation timestamp in UTC")
     metadata: Optional[Metadata] = Field(
         default_factory=Metadata,  # Initialize empty Metadata
-        description="Structured metadata (e.g., SQL query, token usage)"
+        description="Structured metadata (e.g., SQL query, token usage)",
     )
 
     @field_validator("message_id")
@@ -164,7 +189,9 @@ class Message(BaseModel):
     def validate_message_id(cls, v: str) -> str:
         """Ensure message_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("content")
@@ -202,8 +229,9 @@ class Message(BaseModel):
         return {
             "timestamp": self.timestamp_str,
             "role": self.role,
-            "message": self.content
+            "message": self.content,
         }
+
 
 class Session(BaseModel):
     """Session data for a flight log.
@@ -223,39 +251,32 @@ class Session(BaseModel):
     Raises:
         ValueError: If session_id, file_name, file_size, or created_at are invalid.
     """
+
     model_config = ConfigDict(str_strip_whitespace=True)
     session_id: str = Field(
         ...,
         description="Unique session identifier (e.g., UUID)",
-        max_length=MAX_ID_LENGTH
+        max_length=MAX_ID_LENGTH,
     )
-    created_at: datetime = Field(
-        ...,
-        description="Session creation timestamp in UTC"
-    )
+    created_at: datetime = Field(..., description="Session creation timestamp in UTC")
     file_name: str = Field(
         ...,
         description="Sanitized filename of the uploaded log",
-        max_length=MAX_FILE_NAME_LENGTH
+        max_length=MAX_FILE_NAME_LENGTH,
     )
     file_size: int = Field(
-        ...,
-        description="Size of the uploaded file in bytes",
-        ge=0,
-        le=MAX_FILE_SIZE
+        ..., description="Size of the uploaded file in bytes", ge=0, le=MAX_FILE_SIZE
     )
     status: SessionStatus = Field(
-        default=SessionStatus.PENDING,
-        description="Session processing status"
+        default=SessionStatus.PENDING, description="Session processing status"
     )
     status_message: Optional[str] = Field(
         default=None,
         description="Descriptive message for the session status",
-        max_length=MAX_STATUS_MESSAGE_LENGTH
+        max_length=MAX_STATUS_MESSAGE_LENGTH,
     )
     messages: List[Message] = Field(
-        default_factory=list,
-        description=f"List of chat messages (max {MAX_MESSAGES})"
+        default_factory=list, description=f"List of chat messages (max {MAX_MESSAGES})"
     )
 
     @field_validator("session_id")
@@ -263,7 +284,9 @@ class Session(BaseModel):
     def validate_session_id(cls, v: str) -> str:
         """Ensure session_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("file_name")
@@ -271,7 +294,9 @@ class Session(BaseModel):
     def validate_file_name(cls, v: str) -> str:
         """Ensure file_name is valid and safe."""
         if not v or not FILE_NAME_PATTERN.match(v):
-            raise ValueError(f"Invalid file_name: {v}, must be alphanumeric with hyphens/underscores/dots")
+            raise ValueError(
+                f"Invalid file_name: {v}, must be alphanumeric with hyphens/underscores/dots"
+            )
         if v.startswith(".") or v.endswith("."):
             raise ValueError(f"Invalid file_name: {v}, cannot start or end with a dot")
         return v
@@ -292,6 +317,7 @@ class Session(BaseModel):
             raise ValueError(f"Too many messages, maximum is {MAX_MESSAGES}")
         return v
 
+
 class UploadResponse(BaseModel):
     """Response for file upload and session creation.
 
@@ -309,41 +335,29 @@ class UploadResponse(BaseModel):
     Raises:
         ValueError: If fields are invalid (e.g., negative request_duration).
     """
+
     model_config = ConfigDict(str_strip_whitespace=True)
-    timestamp: datetime = Field(
-        ...,
-        description="Response timestamp in UTC"
-    )
+    timestamp: datetime = Field(..., description="Response timestamp in UTC")
     file_name: str = Field(
         ...,
         description="Sanitized filename of the uploaded file",
-        max_length=MAX_FILE_NAME_LENGTH
+        max_length=MAX_FILE_NAME_LENGTH,
     )
     file_size: int = Field(
-        ...,
-        description="Size of the uploaded file in bytes",
-        ge=0,
-        le=MAX_FILE_SIZE
+        ..., description="Size of the uploaded file in bytes", ge=0, le=MAX_FILE_SIZE
     )
     session_id: str = Field(
-        ...,
-        description="Unique session identifier",
-        max_length=MAX_ID_LENGTH
+        ..., description="Unique session identifier", max_length=MAX_ID_LENGTH
     )
-    status: ResponseStatus = Field(
-        ...,
-        description="Upload status (SUCCESS or ERROR)"
-    )
+    status: ResponseStatus = Field(..., description="Upload status (SUCCESS or ERROR)")
     message: str = Field(
         ...,
         description="Descriptive result message",
         max_length=MAX_STATUS_MESSAGE_LENGTH,
-        min_length=1
+        min_length=1,
     )
     request_duration: float = Field(
-        ...,
-        description="Request processing duration in seconds",
-        ge=0.0
+        ..., description="Request processing duration in seconds", ge=0.0
     )
 
     @field_validator("timestamp")
@@ -359,7 +373,9 @@ class UploadResponse(BaseModel):
     def validate_session_id(cls, v: str) -> str:
         """Ensure session_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("file_name")
@@ -367,8 +383,11 @@ class UploadResponse(BaseModel):
     def validate_file_name(cls, v: str) -> str:
         """Ensure file_name is valid and safe."""
         if not v or not FILE_NAME_PATTERN.match(v):
-            raise ValueError(f"Invalid file_name: {v}, must be alphanumeric with hyphens/underscores/dots")
+            raise ValueError(
+                f"Invalid file_name: {v}, must be alphanumeric with hyphens/underscores/dots"
+            )
         return v
+
 
 class ChatRequest(BaseModel):
     """Payload for sending chat messages to the TelemetryAgent.
@@ -393,28 +412,27 @@ class ChatRequest(BaseModel):
         )
         ```
     """
+
     model_config = ConfigDict(str_strip_whitespace=True)
     session_id: str = Field(
-        ...,
-        description="Unique session identifier",
-        max_length=MAX_ID_LENGTH
+        ..., description="Unique session identifier", max_length=MAX_ID_LENGTH
     )
     message: str = Field(
         ...,
         description="User message content",
         max_length=MAX_MESSAGE_LENGTH,
-        min_length=1
+        min_length=1,
     )
     message_id: Optional[str] = Field(
         default=None,
         description="Optional message ID for context",
-        max_length=MAX_ID_LENGTH
+        max_length=MAX_ID_LENGTH,
     )
     max_tokens: Optional[int] = Field(
         default=None,
         description=f"Maximum tokens for assistant response (max {MAX_TOKEN_SAFETY_LIMIT})",
         ge=1,
-        le=MAX_TOKEN_SAFETY_LIMIT
+        le=MAX_TOKEN_SAFETY_LIMIT,
     )
 
     @field_validator("session_id")
@@ -422,7 +440,9 @@ class ChatRequest(BaseModel):
     def validate_session_id(cls, v: str) -> str:
         """Ensure session_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("message")
@@ -443,8 +463,11 @@ class ChatRequest(BaseModel):
             raise ValueError("Message ID cannot be empty")
         # Accept standard ID pattern, UUID pattern, or numeric timestamp
         if not (ID_PATTERN.match(v) or UUID_PATTERN.match(v) or v.isdigit()):
-            raise ValueError(f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores, a UUID, or a numeric timestamp")
+            raise ValueError(
+                f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores, a UUID, or a numeric timestamp"
+            )
         return v
+
 
 class ChatResponse(BaseModel):
     """Response for chat endpoint.
@@ -463,39 +486,30 @@ class ChatResponse(BaseModel):
     Raises:
         ValueError: If fields are invalid (e.g., invalid session_id).
     """
+
     model_config = ConfigDict(str_strip_whitespace=True)
-    timestamp: datetime = Field(
-        ...,
-        description="Response timestamp in UTC"
-    )
+    timestamp: datetime = Field(..., description="Response timestamp in UTC")
     session_id: str = Field(
-        ...,
-        description="Unique session identifier",
-        max_length=MAX_ID_LENGTH
+        ..., description="Unique session identifier", max_length=MAX_ID_LENGTH
     )
     message_id: str = Field(
-        ...,
-        description="Unique message identifier",
-        max_length=MAX_ID_LENGTH
+        ..., description="Unique message identifier", max_length=MAX_ID_LENGTH
     )
     status: ResponseStatus = Field(
-        ...,
-        description="Chat processing status (SUCCESS or ERROR)"
+        ..., description="Chat processing status (SUCCESS or ERROR)"
     )
     message: str = Field(
         ...,
         description="Assistant response or error message",
         max_length=MAX_CONTENT_LENGTH,
-        min_length=1
+        min_length=1,
     )
     metadata: Optional[Metadata] = Field(
         default_factory=Metadata,
-        description="Structured metadata (e.g., SQL query, token usage)"
+        description="Structured metadata (e.g., SQL query, token usage)",
     )
     request_duration: float = Field(
-        ...,
-        description="Request processing duration in seconds",
-        ge=0.0
+        ..., description="Request processing duration in seconds", ge=0.0
     )
 
     @field_validator("timestamp")
@@ -511,7 +525,9 @@ class ChatResponse(BaseModel):
     def validate_session_id(cls, v: str) -> str:
         """Ensure session_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("message_id")
@@ -519,7 +535,9 @@ class ChatResponse(BaseModel):
     def validate_message_id(cls, v: str) -> str:
         """Ensure message_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid message_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("message")
@@ -529,6 +547,7 @@ class ChatResponse(BaseModel):
         if not v.strip():
             raise ValueError("Message content cannot be empty")
         return v
+
 
 class DeleteSessionResponse(BaseModel):
     """Response for session deletion.
@@ -545,30 +564,23 @@ class DeleteSessionResponse(BaseModel):
     Raises:
         ValueError: If fields are invalid (e.g., invalid session_id).
     """
+
     model_config = ConfigDict(str_strip_whitespace=True)
-    timestamp: datetime = Field(
-        ...,
-        description="Response timestamp in UTC"
-    )
+    timestamp: datetime = Field(..., description="Response timestamp in UTC")
     session_id: str = Field(
-        ...,
-        description="Unique session identifier",
-        max_length=MAX_ID_LENGTH
+        ..., description="Unique session identifier", max_length=MAX_ID_LENGTH
     )
     status: ResponseStatus = Field(
-        ...,
-        description="Deletion status (SUCCESS or ERROR)"
+        ..., description="Deletion status (SUCCESS or ERROR)"
     )
     message: str = Field(
         ...,
         description="Descriptive result message",
         max_length=MAX_STATUS_MESSAGE_LENGTH,
-        min_length=1
+        min_length=1,
     )
     request_duration: float = Field(
-        ...,
-        description="Request processing duration in seconds",
-        ge=0.0
+        ..., description="Request processing duration in seconds", ge=0.0
     )
 
     @field_validator("timestamp")
@@ -584,7 +596,9 @@ class DeleteSessionResponse(BaseModel):
     def validate_session_id(cls, v: str) -> str:
         """Ensure session_id is valid and safe."""
         if not v or not ID_PATTERN.match(v):
-            raise ValueError(f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores")
+            raise ValueError(
+                f"Invalid session_id: {v}, must be alphanumeric with hyphens/underscores"
+            )
         return v
 
     @field_validator("message")

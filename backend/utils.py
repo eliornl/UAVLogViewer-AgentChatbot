@@ -17,22 +17,23 @@ INVALID_SESSION_ID_ERROR_MSG: str = "Invalid session ID format: {}"
 # HTTP status code
 BAD_REQUEST_STATUS_CODE: int = 400  # Corresponds to status.HTTP_400_BAD_REQUEST
 
+
 def validate_uuid(uuid_str: str, raise_http_exception: bool = False) -> None:
     """Validate that a string is a valid UUID.
-    
+
     This function checks if a given string is a valid UUID according to RFC 4122.
     It's used throughout the application to validate session IDs and other UUID-based
     identifiers. The function can either raise a standard ValueError or a FastAPI
     HTTPException depending on the context in which it's used.
-    
+
     Args:
         uuid_str: String to validate as UUID (session ID or other identifier)
         raise_http_exception: If True, raises HTTPException instead of ValueError
-        
+
     Raises:
         ValueError: If string is not a valid UUID and raise_http_exception is False
         HTTPException: If string is not a valid UUID and raise_http_exception is True
-        
+
     Example:
         >>> validate_uuid("123e4567-e89b-12d3-a456-426614174000")  # Valid UUID
         >>> validate_uuid("invalid-uuid")  # Raises ValueError
@@ -47,7 +48,7 @@ def validate_uuid(uuid_str: str, raise_http_exception: bool = False) -> None:
             logger.error(INVALID_UUID_ERROR_MSG, session_id=uuid_str)
             raise HTTPException(
                 status_code=BAD_REQUEST_STATUS_CODE,
-                detail=INVALID_SESSION_ID_ERROR_MSG.format(uuid_str)
+                detail=INVALID_SESSION_ID_ERROR_MSG.format(uuid_str),
             )
         else:
             raise ValueError(f"{INVALID_UUID_ERROR_MSG}: {uuid_str}")

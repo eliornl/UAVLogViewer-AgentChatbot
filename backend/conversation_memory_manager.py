@@ -6,7 +6,7 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.memory import (
     CombinedMemory,
     ConversationSummaryBufferMemory,
-    ConversationEntityMemory
+    ConversationEntityMemory,
 )
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain.retrievers import TimeWeightedVectorStoreRetriever
@@ -24,28 +24,33 @@ DocumentList: TypeAlias = List[Document]
 
 # Constants for memory configuration
 # Token limits for different memory strategies
-SHORT_TERM_TOKEN_LIMIT: int = 1000       # Maximum tokens for short-term memory
-MEDIUM_TERM_TOKEN_LIMIT: int = 3000      # Maximum tokens for medium-term memory
+SHORT_TERM_TOKEN_LIMIT: int = 1000  # Maximum tokens for short-term memory
+MEDIUM_TERM_TOKEN_LIMIT: int = 3000  # Maximum tokens for medium-term memory
 
 # Vector retriever settings
-VECTOR_RETRIEVER_DECAY_RATE: float = 0.5  # Decay rate for time-weighted vector retrieval
-VECTOR_RETRIEVER_K: int = 4               # Number of results to retrieve from vector store
+VECTOR_RETRIEVER_DECAY_RATE: float = (
+    0.5  # Decay rate for time-weighted vector retrieval
+)
+VECTOR_RETRIEVER_K: int = 4  # Number of results to retrieve from vector store
 
 # Buffer window settings
-DEFAULT_BUFFER_WINDOW_SIZE: int = 10      # Default number of messages to keep in buffer window
-DEFAULT_TOKEN_LIMIT: int = 1000          # Default token limit for buffer window memory
+DEFAULT_BUFFER_WINDOW_SIZE: int = (
+    10  # Default number of messages to keep in buffer window
+)
+DEFAULT_TOKEN_LIMIT: int = 1000  # Default token limit for buffer window memory
 
 # Performance settings
 MEMORY_UPDATE_TIMEOUT_SECONDS: float = 60.0  # Timeout for memory updates
 
+
 class CustomBufferWindowMemory(BaseMemory):
     """
     Memory implementation that keeps a window of conversation history based on token count.
-    
+
     This implementation maintains recent conversation history up to a specified token limit,
     rather than a fixed number of messages. It's useful for short-term memory in conversation
     systems where context needs to be managed within token constraints.
-    
+
     Attributes:
         chat_memory: Storage for the conversation messages
         max_token_limit: Maximum number of tokens to retain (default: DEFAULT_TOKEN_LIMIT)
@@ -56,6 +61,7 @@ class CustomBufferWindowMemory(BaseMemory):
         output_key: Key for identifying the output field in the outputs dictionary
         token_counter: Function to count tokens in messages (defaults to None)
     """
+
     chat_memory: ChatMessageHistory
     max_token_limit: int = DEFAULT_TOKEN_LIMIT
     k: int = DEFAULT_BUFFER_WINDOW_SIZE  # Fallback if token counting fails
@@ -69,7 +75,7 @@ class CustomBufferWindowMemory(BaseMemory):
     def memory_variables(self) -> List[str]:
         """
         Return the memory variables that are accessed in this memory.
-        
+
         Returns:
             List[str]: List containing the memory key used by this memory component
         """
@@ -78,41 +84,41 @@ class CustomBufferWindowMemory(BaseMemory):
     def load_memory_variables(self, _: Dict[str, Any]) -> Dict[str, Any]:
         """
         Load memory variables from the chat history, keeping messages up to the token limit.
-        
+
         This method retrieves messages from the chat history up to the specified token limit,
         preserving any system message at the beginning. It uses the trim_messages
         function to select messages while maintaining conversation integrity.
-        
+
         Returns:
             Dict[str, Any]: Dictionary with memory_key mapped to either a list of
                            messages or a formatted string (if return_messages=False)
-                           
+
         Raises:
             NotImplementedError: If return_messages=False, as string formatting is
                                 not fully implemented
         """
         messages = self.chat_memory.messages
-        
+
         # Use token counter if provided, otherwise fall back to message count
         token_counter_fn = self.token_counter
         max_tokens = self.max_token_limit
-        
+
         # If no token counter is provided, fall back to message count
         if token_counter_fn is None:
             token_counter_fn = len  # Count messages instead of tokens
-            max_tokens = self.k     # Use k as the maximum number of messages
-        
+            max_tokens = self.k  # Use k as the maximum number of messages
+
         # Trim messages based on token count or message count
         windowed_messages = trim_messages(
             messages,
             max_tokens=max_tokens,
             token_counter=token_counter_fn,
             strategy="last",
-            start_on="human", # Default, good for most chat models
-            include_system=True, # Preserves first system message if any
-            allow_partial=False, # Don't allow partial messages
+            start_on="human",  # Default, good for most chat models
+            include_system=True,  # Preserves first system message if any
+            allow_partial=False,  # Don't allow partial messages
         )
-        
+
         if self.return_messages:
             return {self.memory_key: windowed_messages}
         else:
@@ -125,21 +131,22 @@ class CustomBufferWindowMemory(BaseMemory):
             # buffer_string = get_buffer_string(windowed_messages, human_prefix=..., ai_prefix=...)
             # return {self.memory_key: buffer_string}
             # For now, let's stick to the return_messages=True path as that's what was used.
-            raise NotImplementedError("String buffer formatting not fully implemented for CustomBufferWindowMemory if return_messages=False")
-
+            raise NotImplementedError(
+                "String buffer formatting not fully implemented for CustomBufferWindowMemory if return_messages=False"
+            )
 
     def save_context(self, inputs: Dict[str, Any], outputs: Dict[str, str]) -> None:
         """
         Save the context of this conversation turn to the memory.
-        
+
         This method extracts the user input and AI output from the provided dictionaries
         and adds them to the chat history. It intelligently handles cases where input_key
         and output_key are specified or when they need to be inferred from the dictionaries.
-        
+
         Args:
             inputs (Dict[str, Any]): Dictionary containing the user's input message
             outputs (Dict[str, str]): Dictionary containing the AI's output message
-            
+
         Note:
             This logic assumes inputs has one key (e.g. "input" or "human_input")
             and outputs has one key (e.g. "output" or "ai_output").
@@ -147,41 +154,42 @@ class CustomBufferWindowMemory(BaseMemory):
         """
         # Determine input message string
         if self.input_key is None:
-            input_str = next(iter(inputs.values())) # Get the first value
+            input_str = next(iter(inputs.values()))  # Get the first value
         else:
             input_str = inputs[self.input_key]
 
         # Determine output message string
         if self.output_key is None:
-            output_str = next(iter(outputs.values())) # Get the first value
+            output_str = next(iter(outputs.values()))  # Get the first value
         else:
             output_str = outputs[self.output_key]
-            
+
         self.chat_memory.add_user_message(input_str)
         self.chat_memory.add_ai_message(output_str)
-
 
     def clear(self) -> None:
         """
         Clear all messages from the chat memory.
-        
+
         This method removes all stored messages from the chat history,
         effectively resetting the conversation memory to its initial state.
         """
         self.chat_memory.clear()
 
+
 MemoryType: TypeAlias = Union[
-    CustomBufferWindowMemory,
-    ConversationSummaryBufferMemory,
-    CombinedMemory
+    CustomBufferWindowMemory, ConversationSummaryBufferMemory, CombinedMemory
 ]
+
 
 class MemoryStrategy(Enum):
     """Enum defining available memory strategies for conversation history management."""
+
     SHORT_TERM = "buffer_memory"
     MEDIUM_TERM = "summarized_memory"
     ADVANCED = "enhanced_context_memory"
     FALLBACK = "fallback_context_memory"
+
 
 class ConversationMemoryManager:
     """Manages conversation history and memory strategies asynchronously based on token count.
@@ -261,6 +269,7 @@ class ConversationMemoryManager:
             asyncio.TimeoutError: If memory update exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
         try:
+
             async def update_memory() -> None:
                 user_content, assistant_content = message_pair
                 msg_tokens: int = self.llm_token_encoder.count_tokens([message_pair])
@@ -268,18 +277,24 @@ class ConversationMemoryManager:
                 self.llm_token_count += msg_tokens
                 self.logger.debug(
                     "Added message pair to history",
-                    user_tokens=self.llm_token_encoder.count_tokens([(user_content, "")]),
-                    assistant_tokens=self.llm_token_encoder.count_tokens([("", assistant_content)]),
-                    total_tokens=self.llm_token_count
+                    user_tokens=self.llm_token_encoder.count_tokens(
+                        [(user_content, "")]
+                    ),
+                    assistant_tokens=self.llm_token_encoder.count_tokens(
+                        [("", assistant_content)]
+                    ),
+                    total_tokens=self.llm_token_count,
                 )
 
-                expected_strategy: MemoryStrategy = self._get_expected_strategy(self.llm_token_count)
+                expected_strategy: MemoryStrategy = self._get_expected_strategy(
+                    self.llm_token_count
+                )
                 if expected_strategy != self.memory_strategy:
                     self.logger.info(
                         "Switching memory strategy",
                         current_strategy=self.memory_strategy.value,
                         new_strategy=expected_strategy.value,
-                        llm_token_count=self.llm_token_count
+                        llm_token_count=self.llm_token_count,
                     )
                     self.memory, self.memory_strategy = await self._initialize_memory(
                         self.llm_token_count, self.history
@@ -287,13 +302,22 @@ class ConversationMemoryManager:
 
             await asyncio.wait_for(
                 asyncio.create_task(update_memory()),
-                timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+                timeout=MEMORY_UPDATE_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            self.logger.error("Memory update timed out", timeout=MEMORY_UPDATE_TIMEOUT_SECONDS)
-            raise ValueError(f"Memory update timed out after {MEMORY_UPDATE_TIMEOUT_SECONDS} seconds")
+            self.logger.error(
+                "Memory update timed out", timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            )
+            raise ValueError(
+                f"Memory update timed out after {MEMORY_UPDATE_TIMEOUT_SECONDS} seconds"
+            )
         except Exception as e:
-            self.logger.error("Failed to add message pair", message_pair=message_pair, error=str(e), exc_info=True)
+            self.logger.error(
+                "Failed to add message pair",
+                message_pair=message_pair,
+                error=str(e),
+                exc_info=True,
+            )
             raise ValueError(f"Failed to add message pair: {str(e)}") from e
 
     def _get_expected_strategy(self, llm_token_count: int) -> MemoryStrategy:
@@ -330,19 +354,21 @@ class ConversationMemoryManager:
         """
         self.logger.warning(
             "Token count exceeds context limit, using FALLBACK strategy",
-            llm_token_count=llm_token_count
+            llm_token_count=llm_token_count,
         )
         memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=self.fallback_token_limit,
             memory_key="history",
             chat_memory=ChatMessageHistory(),
-            return_messages=True
+            return_messages=True,
         )
         recent_messages: List[MessagePair] = []
         current_tokens: int = 0
         for user_content, assistant_content in reversed(history):
-            msg_tokens: int = self.llm_token_encoder.count_tokens([(user_content, assistant_content)])
+            msg_tokens: int = self.llm_token_encoder.count_tokens(
+                [(user_content, assistant_content)]
+            )
             if current_tokens + msg_tokens <= self.fallback_token_limit:
                 recent_messages.append((user_content, assistant_content))
                 current_tokens += msg_tokens
@@ -356,8 +382,7 @@ class ConversationMemoryManager:
                 memory.chat_memory.add_ai_message(assistant_content)
 
         await asyncio.wait_for(
-            asyncio.to_thread(load_messages),
-            timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            asyncio.to_thread(load_messages), timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
         self.logger.info("Initialized FALLBACK memory", total_tokens=current_tokens)
         return memory, MemoryStrategy.FALLBACK
@@ -377,14 +402,20 @@ class ConversationMemoryManager:
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
-        self.logger.info("Initializing SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT)
+        self.logger.info(
+            "Initializing SHORT_TERM memory", max_token_limit=SHORT_TERM_TOKEN_LIMIT
+        )
         memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
             max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
             k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
-            memory_key="history", # Explicitly set
+            memory_key="history",  # Explicitly set
             return_messages=True,  # Explicitly set
-            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
+            token_counter=(
+                self.llm_token_encoder.count_message_tokens
+                if self.llm_token_encoder
+                else None
+            ),
         )
 
         def load_messages() -> None:
@@ -393,8 +424,7 @@ class ConversationMemoryManager:
                 memory.chat_memory.add_ai_message(assistant_content)
 
         await asyncio.wait_for(
-            asyncio.to_thread(load_messages),
-            timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            asyncio.to_thread(load_messages), timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
         self.logger.info("Initialized SHORT_TERM memory", message_count=len(history))
         return memory, MemoryStrategy.SHORT_TERM
@@ -413,21 +443,27 @@ class ConversationMemoryManager:
         Raises:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
-        self.logger.info("Initializing MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
+        self.logger.info(
+            "Initializing MEDIUM_TERM memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT
+        )
         buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
             max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
             k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
-            memory_key="buffer_history", # Explicitly set
-            return_messages=True,        # Explicitly set
-            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
+            memory_key="buffer_history",  # Explicitly set
+            return_messages=True,  # Explicitly set
+            token_counter=(
+                self.llm_token_encoder.count_message_tokens
+                if self.llm_token_encoder
+                else None
+            ),
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=SHORT_TERM_TOKEN_LIMIT,
             memory_key="summary_history",
             chat_memory=ChatMessageHistory(),
-            return_messages=True
+            return_messages=True,
         )
 
         def load_messages() -> None:
@@ -438,12 +474,9 @@ class ConversationMemoryManager:
                 summary_memory.chat_memory.add_ai_message(assistant_content)
 
         await asyncio.wait_for(
-            asyncio.to_thread(load_messages),
-            timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            asyncio.to_thread(load_messages), timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
-        combined_memory = CombinedMemory(
-            memories=[buffer_memory, summary_memory]
-        )
+        combined_memory = CombinedMemory(memories=[buffer_memory, summary_memory])
         self.logger.info("Initialized MEDIUM_TERM memory", message_count=len(history))
         return combined_memory, MemoryStrategy.MEDIUM_TERM
 
@@ -465,53 +498,63 @@ class ConversationMemoryManager:
             asyncio.TimeoutError: If memory initialization exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
             ValueError: If vector store initialization fails or embeddings are not initialized.
         """
-        self.logger.info("Initializing ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT)
+        self.logger.info(
+            "Initializing ADVANCED memory", max_token_limit=MEDIUM_TERM_TOKEN_LIMIT
+        )
 
         # Initialize memory components
         buffer_memory = CustomBufferWindowMemory(
             chat_memory=ChatMessageHistory(),
             max_token_limit=SHORT_TERM_TOKEN_LIMIT,  # Use token-based limit
             k=DEFAULT_BUFFER_WINDOW_SIZE,  # Fallback if token counting fails
-            memory_key="buffer_history", # Explicitly set
-            return_messages=True,        # Explicitly set
-            token_counter=self.llm_token_encoder.count_message_tokens if self.llm_token_encoder else None
+            memory_key="buffer_history",  # Explicitly set
+            return_messages=True,  # Explicitly set
+            token_counter=(
+                self.llm_token_encoder.count_message_tokens
+                if self.llm_token_encoder
+                else None
+            ),
         )
         summary_memory = ConversationSummaryBufferMemory(
             llm=self.llm,
             max_token_limit=MEDIUM_TERM_TOKEN_LIMIT,
             memory_key="summary_history",
             chat_memory=ChatMessageHistory(),
-            return_messages=True
+            return_messages=True,
         )
         entity_memory = ConversationEntityMemory(
-            llm=self.llm,
-            memory_key="entity_history",
-            return_messages=True
+            llm=self.llm, memory_key="entity_history", return_messages=True
         )
 
         # Load messages and build documents
         documents: DocumentList = []
+
         def load_messages() -> None:
             for user_content, assistant_content in history:
                 buffer_memory.chat_memory.add_user_message(user_content)
                 buffer_memory.chat_memory.add_ai_message(assistant_content)
                 summary_memory.chat_memory.add_user_message(user_content)
                 summary_memory.chat_memory.add_ai_message(assistant_content)
-                entity_memory.save_context({"input": user_content}, {"output": assistant_content})
+                entity_memory.save_context(
+                    {"input": user_content}, {"output": assistant_content}
+                )
                 documents.append(
                     Document(
                         page_content=f"User: {user_content}\nAssistant: {assistant_content}",
-                        metadata={"user_content": user_content, "assistant_content": assistant_content}
+                        metadata={
+                            "user_content": user_content,
+                            "assistant_content": assistant_content,
+                        },
                     )
                 )
 
         await asyncio.wait_for(
-            asyncio.to_thread(load_messages),
-            timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+            asyncio.to_thread(load_messages), timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
         )
 
         # Create FAISS vector store for conversation history
         try:
+
             def init_vector_store() -> FAISS:
                 if not self.embeddings:
                     raise ValueError("Embeddings not initialized")
@@ -519,19 +562,25 @@ class ConversationMemoryManager:
 
             vector_store = await asyncio.wait_for(
                 asyncio.to_thread(init_vector_store),
-                timeout=MEMORY_UPDATE_TIMEOUT_SECONDS
+                timeout=MEMORY_UPDATE_TIMEOUT_SECONDS,
             )
         except Exception as e:
-            self.logger.error("Failed to initialize FAISS vector store", error=str(e), exc_info=True)
-            raise ValueError(f"Failed to initialize vector store for conversation history: {str(e)}") from e
+            self.logger.error(
+                "Failed to initialize FAISS vector store", error=str(e), exc_info=True
+            )
+            raise ValueError(
+                f"Failed to initialize vector store for conversation history: {str(e)}"
+            ) from e
 
         # Use TimeWeightedVectorStoreRetriever for conversation history searches
         retriever = TimeWeightedVectorStoreRetriever(
             vectorstore=vector_store,
             decay_rate=VECTOR_RETRIEVER_DECAY_RATE,
-            k=VECTOR_RETRIEVER_K
+            k=VECTOR_RETRIEVER_K,
         )
-        vector_memory = retriever.as_memory(memory_key="vector_history", return_messages=True)
+        vector_memory = retriever.as_memory(
+            memory_key="vector_history", return_messages=True
+        )
 
         combined_memory = CombinedMemory(
             memories=[buffer_memory, summary_memory, entity_memory, vector_memory]
