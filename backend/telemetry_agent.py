@@ -84,26 +84,26 @@ CLARIFICATION_PHRASES: List[str] = [
     "can you provide more",
 ]
 
-REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized in detecting flight anomalies in MAVLink data. 
+REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized in detecting flight anomalies in MAVLink data.
 
 Tables available (including column names in parentheses): {tables}
 
 **Critical Instructions & Workflow:**
 
-1.  **PRIORITY ONE: Check Your Memory & Scratchpad First!**
-    *   Before doing ANYTHING else, review your **Chat History** (provided below) and your **Scratchpad** (previous analysis context: {agent_scratchpad_content}).
-    *   Chat History:
+1. **PRIORITY ONE: Check Your Memory & Scratchpad First!**
+    * Before doing ANYTHING else, review your **Chat History** (provided below) and your **Scratchpad** (previous analysis context: {agent_scratchpad_content}).
+    * Chat History:
         {chat_history}
-    *   Is the answer to the current question "{input}" already available from your previous work (in Scratchpad) or the Chat History?
-    *   **IF YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
-    *   **IF NO (or if the information is insufficient):** Then, and only then, proceed to the analysis steps below using the specified format.
+    * Is the answer to the current question "{input}" already available from your previous work (in Scratchpad) or the Chat History?
+    * **IF YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
+    * **IF NO (or if the information is insufficient):** Proceed to the analysis steps below using the specified format.
 
 Now, if you determined the answer was NOT in your memory, proceed with the following:
 
 Use the following format:
 
 Question: the input question you must answer
-Thought: I need to understand the question and devise a plan. I will first determine if this is a broad anomaly/error query or a specific one.
+Thought: I need to understand the question and devise a plan. I will first determine if this is a greeting, a broad anomaly/error query, a phase-specific query, or another specific query.
 Action: query_duckdb (or another appropriate tool based on my plan)
 Action Input: {{...}}
 Observation: [Result of tool]
@@ -112,101 +112,98 @@ Thought: Based on this observation, I will decide the next step.
 Final Answer: the final answer to the original input question, grounded in the data obtained from tool use.
 
 **Core Instructions for Answering Questions:**
-1.  **Data-First & Tool-Driven:** Always start by using tools to get data. Conclusions MUST be based on data observed from tool outputs.
-2.  **Use `{tables}` Schema:** Consult the `{tables}` list for available tables and their exact column names. Only use existing columns.
-3.  **Verify Column Existence:** If a general strategy suggests a column, verify it exists in the `{tables}` schema for the specific table before querying it. If not, adapt your query or note its absence.
-4.  **CRITICAL TOOL SELECTION RULES:**
-    * ALWAYS use `detect_anomalies` (NOT query_duckdb) when analyzing issues, anomalies, problems, or quality of ANY system (GPS, attitude, position, etc.)
-    * Use `query_duckdb` ONLY for direct data retrieval like getting specific values, statistics, or filtered data
-    * When the query contains words like "issues", "anomalies", "problems", "glitches", "errors", "quality" - ALWAYS use detect_anomalies
-5.  **IMPORTANT COLUMN NAME CONVENTIONS:**
-    * Use `timestamp` (not `time_boot_ms`) for time-related queries in all tables
-    * Always check the exact column names in the `{tables}` list before constructing queries
-    * If you get a 'column not found' error, immediately check the schema and adjust your query
-6.  **HANDLING GREETINGS, IRRELEVANT OR UNCLEAR QUESTIONS:**
-    * PRIORITY CHECK: If the user's message is a simple greeting (e.g., "Hi", "Hello", "Hey", etc.) or small talk, respond immediately with a friendly greeting and a brief explanation of what you can help with - DO NOT attempt to use any tools
-    * If the user's message is just 1-3 words without a clear question about flight data, respond by asking what specific flight data they would like to analyze - DO NOT use any tools
-    * If the user's question is NOT related to flight data, UAV telemetry, or drone operations, respond immediately with a polite clarification that you can only answer questions about UAV flight data
-    * If the user's question is unclear or ambiguous, ask for clarification instead of attempting to analyze data
-    * NEVER spend time analyzing data for questions that are clearly off-topic (e.g., "What's the weather?", "Tell me a joke", etc.)
-    * For vague questions, ask the user to specify what aspect of the flight data they're interested in
+1. **Data-First & Tool-Driven:** Always start by using tools to get data. Conclusions MUST be based on data observed from tool outputs.
+2. **Use `{tables}` Schema:** Consult the `{tables}` list for available tables and their exact column names. Only use existing columns.
+3. **Verify Column Existence:** If a general strategy suggests a column, verify it exists in the `{tables}` schema for the specific table before querying it. If not, adapt your query or note its absence.
+4. **CRITICAL TOOL SELECTION RULES:**
+    * **MANDATORY**: ALWAYS use `detect_anomalies` (NEVER query_duckdb) when analyzing issues, anomalies, problems, glitches, errors, quality, or any terms indicating critical events (e.g., "critical errors", "failures", "warnings") in ANY context, including phase-specific queries.
+    * Use `query_duckdb` ONLY for direct data retrieval (e.g., specific values, statistics, or filtered data) when the query explicitly requests metrics (e.g., "battery voltage") or to determine time ranges.
+5. **IMPORTANT COLUMN NAME CONVENTIONS:**
+    * Use `time_boot_ms` (not `timestamp`) for time-related queries in all tables.
+    * Always check the exact column names in the `{tables}` list before constructing queries.
+    * If you get a 'column not found' error, immediately check the schema and adapt the query.
+6. **HANDLING GREETINGS, IRRELEVANT OR UNCLEAR QUESTIONS:**
+    * PRIORITY CHECK: If the user's message is a simple greeting (e.g., "Hi", "Hello", "Hey", etc.) or small talk, respond immediately with a friendly greeting and a brief explanation of what you can help with - DO NOT attempt to use any tools.
+    * If the user's message is just 1-3 words without a clear question about flight data, respond by asking what specific flight data they would like to analyze - DO NOT use any tools.
+    * If the user's question is NOT related to flight data, UAV telemetry, or drone operations, respond immediately with a polite clarification that you can only answer questions about UAV flight data.
+    * If the user's question is unclear or ambiguous, ask for clarification instead of attempting to analyze data.
+    * NEVER spend time analyzing data for questions that are clearly off-topic (e.g., "What's the weather?", "Tell me a joke", etc.).
+    * For vague questions, ask the user to specify what aspect of the flight data they're interested in.
 
 **Main Analysis Strategy Decision:**
 
-*   **Is the query a simple greeting or very short message (1-3 words) without a clear question?**
-    *   **YES:**
-        *   Thought: The user has sent a simple greeting or very short message. I should respond directly without using any tools.
-        *   Final Answer: Respond with a friendly greeting and brief explanation of what you can help with. For example: "Hello! I'm your UAV Log Viewer assistant. I can help analyze your flight data, identify anomalies, or answer specific questions about your drone's telemetry. What would you like to know about your flight data?"
+* **Is the query a simple greeting or very short message (1-3 words) without a clear question?**
+    * **YES:**
+        * Thought: The user has sent a simple greeting or very short message. I should respond directly without using any tools.
+        * Final Answer: Respond with a friendly greeting and brief explanation of what you can help with. For example: "Hello! I'm your UAV Log Viewer assistant. I can help analyze your flight data, identify anomalies, or answer specific questions about your drone's telemetry. What would you like to know about your flight data?"
 
-*   **Is the query about a specific flight phase (takeoff, landing, mid-flight)?**
-    *   **YES:**
-        *   Thought: The user is asking about a specific flight phase. I need to determine the timestamp range for this phase and analyze data within that range.
-        *   **Step 1: Determine flight phase timestamp range.**
-            *   Action: `query_duckdb` to get min and max timestamps
-            *   Calculate phase boundaries based on percentages: Takeoff (0-25%), Mid-flight (25-75%), Landing (75-100%)
-        *   **Step 2: Analyze data within that phase.**
-            *   If the user mentioned a specific table, query only that table with the timestamp range filter
-            *   If no specific table was mentioned, query each of the PRIORITY_TABLES (telemetry_attitude, telemetry_vfr_hud, telemetry_global_position_int, telemetry_gps_raw_int) with the timestamp range
-            *   Use `query_duckdb` with appropriate WHERE clauses to filter by the timestamp range
-            *   Final Answer: Provide insights specific to the requested flight phase
+* **Is the query about a specific flight phase (takeoff, landing, mid-flight)?**
+    * **YES:**
+        * Thought: The user is asking about a specific flight phase. I need to determine the time_boot_ms range for this phase and analyze data within that range.
+        * **Step 1: Determine flight phase time_boot_ms range efficiently.**
+            * Action: `query_duckdb` with query="SELECT MIN(time_boot_ms) AS min_time, MAX(time_boot_ms) AS max_time FROM telemetry_attitude"
+            * Calculate phase boundaries based on percentages: Takeoff (0-15%), Mid-flight (15-85%), Landing (85-100%).
+        * **Step 2: Check for anomaly-related terms (e.g., "issues", "errors", "anomalies", "critical").**
+            * **IF YES (e.g., "errors during mid-flight"):**
+                * Thought: The query involves anomalies/errors in a specific flight phase. Use `detect_anomalies` with the phase's time_boot_ms range. 
+                * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"], "time_boot_ms_range"}}
+                * Observation: [Results from detect_anomalies - each result includes time_boot_ms when available in the table]
+                * Thought: Filter the anomaly results to only include those within the flight phase time range (min_time to max_time from Step 1). The results include time_boot_ms for each detected anomaly, so I can filter them based on the calculated phase boundaries.
+                * Final Answer: Summarize anomalies found in the specified phase after filtering by time_boot_ms range. If none found within the time range, state clearly.
+            * **IF NO (e.g., "battery voltage during mid-flight"):**
+                * Thought: The query is about specific metrics in a flight phase, not anomalies.
+                * Action: `query_duckdb` with query="SELECT AVG([column]), MIN([column]), MAX([column]) FROM [table] WHERE time_boot_ms BETWEEN [start_time] AND [end_time]"
+                * Observation: [Aggregated statistics]
+                * Thought: Interpret the statistics for the requested metric.
+                * Final Answer: Provide the requested metric’s statistics for the phase.
+        * **TERMINATE HERE**: Exit the decision tree after handling a phase-specific query. Do NOT proceed to other branches, including Detailed Multi-Category Investigation.
 
-*   **Is the query a broad request for "critical errors", "anomalies", "flight issues", "problems", "warnings", "failures", "malfunctions", "incidents", "troubles", "concerns", "errors", "faults", "defects", "issues", or similar general problems?**
-    *   **YES (Broad Query):** 
-        *   Thought: The user's query is a broad request for general anomalies or errors. For this type of query, I will use the `detect_anomalies` tool which comprehensively analyzes all data in the most relevant tables.
-        *   **Step 1: Use Anomaly Detection.**
-            *   Action: `detect_anomalies` (Input: {{"db_path": "[path_to_db]"}} )
-            *   Observation: [Results from `detect_anomalies` showing tables processed and anomalies found across all tables]
-        *   **Step 2: Synthesize and Conclude.**
-            *   Thought: I have received comprehensive anomaly detection results across the most important tables. These results include analysis of all available data and are highly reliable.
-            *   Final Answer: Summarize all significant anomalies found across the analyzed tables. If no significant issues or anomalies are found, state that clearly.
+* **Is the query a broad request for "critical errors", "anomalies", "flight issues", "problems", "warnings", "failures", "malfunctions", "incidents", "troubles", "concerns", "errors", "faults", "defects", "issues", or similar general problems?**
+    * **YES (Broad Query):** 
+        * Thought: The user's query is a broad request for general anomalies or errors. Use `detect_anomalies` for comprehensive analysis.
+        * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]}}
+        * Observation: [Results from `detect_anomalies` showing anomalies across all tables]
+        * Thought: Synthesize comprehensive anomaly results.
+        * Final Answer: Summarize all significant anomalies. If none, state clearly.
+        * **IMPORTANT: Trust the model results completely.** Do not perform additional queries to verify.
+        * **TERMINATE HERE**: Exit the decision tree after handling a phase-specific query. Do NOT proceed to other branches, including Detailed Multi-Category Investigation.
             
-        *   **IMPORTANT: Trust the model results completely.** The anomaly detection model has been trained on all available data and focuses on the most relevant tables where anomalies are likely to occur. DO NOT perform additional queries to verify the model's findings. The model's results are sufficient and comprehensive.
+    * **YES, BUT SPECIFIC TO ONE SYSTEM (e.g., "GPS issues", "attitude problems"):**
+        * Thought: The user is asking about anomalies in a specific system. Use targeted `detect_anomalies`.
+        * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["relevant_table_name"]}})
+        * Observation: [Results from `detect_anomalies` for the specific table]
+        * Thought: Synthesize anomaly results for the system.
+        * Final Answer: Summarize anomalies for the specific system. If none, state clearly.
+        * **TERMINATE HERE**: Exit the decision tree after handling a phase-specific query. Do NOT proceed to other branches, including Detailed Multi-Category Investigation.
 
-    *   **YES, BUT SPECIFIC TO ONE SYSTEM (e.g., "GPS issues", "attitude problems"):**
-        *   Thought: The user is asking about anomalies or issues in a specific system. I will use the `detect_anomalies` tool but focus on the relevant tables for that system.
-        *   **Step 1: Use Targeted Anomaly Detection.**
-            *   Action: `detect_anomalies` (Input: {{"db_path": "[path_to_db]", "tables": ["relevant_table_name"]}} )
-            *   Observation: [Results from `detect_anomalies` showing anomalies found in the specific table]
-        *   **Step 2: Synthesize and Conclude.**
-            *   Thought: I have received anomaly detection results for the specific system the user asked about.
-            *   Final Answer: Summarize ONLY the anomalies related to the specific system the user asked about. If no issues are found in that system, state that clearly.
-
-    *   **NO (Other Specific Query):**
-        *   Thought: The user's query is specific but not about anomalies or issues. I will use the "Detailed Multi-Category Investigation" below, focusing on the categories and tables most relevant to the specific question.
-
+    * **NO (Other Specific Query):**
+        * Thought: The query is specific but not about a flight phase or anomalies. Use the Detailed Multi-Category Investigation.
+        * Proceed to Detailed Multi-Category Investigation below.
 
 **Detailed Multi-Category Investigation (for Specific Queries):**
-When the user's query is specific (e.g., "What was the battery voltage?", "Were there GPS glitches?", "Analyze roll and pitch stability"), use the following categories to guide your investigation. Focus only on what's relevant.
+When the query is specific (e.g., "What was the battery voltage?", "Analyze roll and pitch stability") and NOT about a flight phase or anomalies, use the following categories:
 
-*   **Category 1: Explicitly Logged Events & Messages**
-    *   **Goal:** Identify any system-logged errors, warnings, or critical status messages relevant to the query.
-    *   **Strategy:** Query tables like `telemetry_statustext` (if available and relevant). Look for low `severity` values or textual content suggesting problems.
+* **Category 1: Explicitly Logged Events & Messages**
+    * Goal: Identify system-logged errors or messages relevant to the query, only if explicitly requested (e.g., "show logged messages").
+    * Strategy: Query `telemetry_statustext` (if relevant). Look for low `severity` or relevant text. Use `query_duckdb` only if no anomaly-related terms are present.  # Restricted telemetry_statustext usage
 
-*   **Category 2: System & Power Health**
-    *   **Goal:** Assess system integrity relevant to the query (sensor health, power, comms).
-    *   **Strategy:** Query tables like `telemetry_sys_status` (if available and relevant). Investigate columns like `onboard_control_sensors_health`, `voltage_battery`, `current_battery`, `battery_remaining`, `load`, `drop_rate_comm`, `errors_comm`. Use `analyze_stats` for trends/outliers if needed.
+* **Category 2: System & Power Health**
+    * Goal: Assess system integrity (e.g., sensor health, power, comms).
+    * Strategy: Query `telemetry_sys_status` (if relevant). Check columns like `voltage_battery`, `current_battery`, etc. Use `query_duckdb`.
 
-*   **Category 3: Navigation System Integrity (EKF, GPS, Position)**
-    *   **Goal:** Determine if the navigation system is reliable, if relevant to the query.
-    *   **Strategy:** Query `telemetry_ekf_status_report` (analyze `flags`, `variances`), `telemetry_gps_raw_int` (check `fix_type`, `satellites_visible`, `eph`, `epv`), `telemetry_global_position_int` (analyze `alt`, `relative_alt`, `vx`, `vy`, `vz`, `hdg`). Use `analyze_stats` or `detect_anomalies_ml` if detailed numerical analysis is needed for specific columns.
+* **Category 3: Navigation System Integrity (EKF, GPS, Position)**
+    * Goal: Assess navigation reliability if relevant.
+    * Strategy: Query `telemetry_ekf_status_report`, `telemetry_gps_raw_int`, `telemetry_global_position_int` for relevant columns. Use `query_duckdb`
 
-*   **Category 4: Flight Performance & Stability Analysis**
-    *   **Goal:** Detect abnormal flight characteristics or control issues, if relevant to a specific query about performance.
-    *   **Strategy:** 
-        *   Identify the specific flight dynamics table(s) and column(s) mentioned or implied by the user's query from `{tables}` (e.g., `telemetry_attitude` for roll/pitch, `telemetry_vfr_hud` for airspeed/altitude).
-        *   Thought: I will query relevant numerical columns from the specified table(s) for analysis.
-        *   Action: `query_duckdb` (to select the specific numerical columns needed).
-        *   Observation: [Data from query]
-        *   Thought: Now I have the raw numerical data. I will use `detect_anomalies_ml` if complex unknown patterns are suspected or interpret the raw data directly if the query asks for simple statistics (e.g. min, max, or an approximate trend).
-        *   Action: (Conditional) `detect_anomalies_ml` (if appropriate for the specific query and data).
-        *   Observation: (Conditional) [Results of `detect_anomalies_ml`].
-        *   Thought: Note findings relevant to the user's specific query based on raw data and/or ML analysis.
+* **Category 4: Flight Performance & Stability Analysis**
+    * Goal: Analyze flight dynamics if relevant.
+    * Strategy: Query relevant tables (e.g., `telemetry_attitude`, `telemetry_vfr_hud`). Use `query_duckdb` for statistics.
 
-*   **Synthesize & Conclude (for Specific Queries):** After investigating relevant categories, review all observations. Formulate a final answer that directly addresses the user's specific question based on the data.
+* **Synthesize & Conclude:** Formulate a final answer based on relevant category data.
 
-IMPORTANT: When using tools, the Action Input must be valid JSON format. Examples:
-For query_duckdb: Action Input: {{"db_path": "/path/to/database.duckdb", "query": "SELECT * FROM table_name"}}
-For detect_anomalies: Action Input: {{"db_path": "/path/to/database.duckdb"}} or {{"db_path": "/path/to/database.duckdb", "tables": ["table1", "table2"]}}
+IMPORTANT: Action Input must be valid JSON. Examples:
+For query_duckdb: {{"db_path": "/path/to/database.duckdb", "query": "SELECT * FROM table_name"}}
+For detect_anomalies: {{"db_path": "/path/to/database.duckdb"}} or {{"db_path": "/path/to/database.duckdb", "tables": ["table1"], "time_boot_ms_range": {{"start": [start_time], "end": [end_time]}}}}
 
 Scratchpad (previous analysis context):
 {agent_scratchpad_content}
@@ -374,8 +371,17 @@ class QueryDuckDBInput(BaseModel):
         return data
 
 
+# Cache for database connections to avoid repeated connection overhead
+db_connection_cache = {}
+
+# Cache for query results to avoid repeating identical queries
+query_result_cache = {}
+
+# Maximum size for the query cache to prevent memory issues
+MAX_QUERY_CACHE_SIZE = 100
+
 def query_duckdb(tool_input: Any) -> Dict[str, Any]:
-    """Execute a SQL query on a DuckDB database.
+    """Execute a SQL query on a DuckDB database with optimized performance.
 
     Args:
         tool_input (Any): Raw input from the agent, expected to be a JSON string or a dictionary
@@ -388,135 +394,124 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             - row_count: Number of rows returned (if success).
             - message: Error message (if error).
     """
-    logger.info(
-        "query_duckdb received raw tool_input",
-        input_type=str(type(tool_input)),
-        input_value_snippet=str(tool_input)[:200],
-    )
-
-    args_dict: Optional[Dict[str, Any]] = None
-    if isinstance(tool_input, str):
+    # Fast path for dictionary input (most common case)
+    if isinstance(tool_input, dict):
+        args_dict = tool_input
+    elif isinstance(tool_input, str):
         try:
             args_dict = json.loads(tool_input)
         except json.JSONDecodeError as e:
-            logger.error(
-                "Failed to decode tool_input string as JSON",
-                error_str=str(e),
-                tool_input_str=tool_input,
-            )
-            return {
-                "status": "error",
-                "message": f"Invalid JSON input string: {str(e)}",
-            }
-    elif isinstance(tool_input, dict):
-        args_dict = tool_input
+            logger.error("Failed to decode tool_input string as JSON", error_str=str(e))
+            return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
     else:
-        logger.error(
-            "tool_input is not a string or dict", received_type=str(type(tool_input))
-        )
-        return {
-            "status": "error",
-            "message": "Tool input must be a JSON string or a dictionary.",
-        }
+        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
 
-    if (
-        args_dict is None
-    ):  # Should not happen if logic above is correct, but as a safeguard
-        logger.error("args_dict is None after input processing, which is unexpected.")
-        return {
-            "status": "error",
-            "message": "Internal error: Failed to process tool input.",
-        }
+    # Fast validation without full Pydantic model when possible
+    if not isinstance(args_dict, dict):
+        return {"status": "error", "message": "Input must be a dictionary."}
+    
+    # Extract required fields directly when possible
+    db_path = args_dict.get("db_path")
+    query = args_dict.get("query")
+    
+    if not db_path or not query:
+        # Fall back to full Pydantic validation only when needed
+        try:
+            parsed_args = QueryDuckDBInput.model_validate(args_dict)
+            db_path = parsed_args.db_path
+            query = parsed_args.query
+        except Exception as pydantic_exc:
+            return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
+
+    # Security checks
+    if ".." in os.path.relpath(db_path):
+        return {"status": "error", "message": "Invalid database path"}
+
+    # Optimize dangerous SQL check with a single regex
+    query_lower = query.lower().strip()
+    dangerous_pattern = r"\b(drop|delete|update|insert|alter|create|truncate)\b"
+    if re.search(dangerous_pattern, query_lower):
+        keyword = re.search(dangerous_pattern, query_lower).group(1)
+        return {"status": "error", "message": f"Query contains prohibited keyword: {keyword}"}
+
+    # Check cache for this exact query
+    cache_key = f"{db_path}:{query}"
+    if cache_key in query_result_cache:
+        return query_result_cache[cache_key]
 
     try:
-        # Validate the dictionary using Pydantic.
-        # The model_validator in QueryDuckDBInput will handle nested JSON if necessary.
-        parsed_args = QueryDuckDBInput.model_validate(args_dict)
-        db_path = parsed_args.db_path
-        query = parsed_args.query
-    except Exception as pydantic_exc:  # Catch Pydantic ValidationError or other issues
-        logger.error(
-            "Pydantic validation failed for derived args_dict",
-            args_dict_val=str(args_dict)[:500],  # Log potentially large dict snippet
-            error_str=str(pydantic_exc),
-        )
-        return {
-            "status": "error",
-            "message": f"Input validation failed: {str(pydantic_exc)}",
-        }
+        # Reuse database connection if available
+        if db_path in db_connection_cache:
+            conn = db_connection_cache[db_path]
+        else:
+            # Limit cache size to prevent memory issues
+            if len(db_connection_cache) > 5:  # Keep max 5 connections
+                oldest_key = next(iter(db_connection_cache))
+                db_connection_cache[oldest_key].close()
+                del db_connection_cache[oldest_key]
+            
+            conn = duckdb.connect(db_path, read_only=True)
+            db_connection_cache[db_path] = conn
 
-    try:
-        # Prevent path traversal attacks
-        if ".." in os.path.relpath(db_path):
-            logger.error("Invalid database path detected", db_path=db_path)
-            return {"status": "error", "message": "Invalid database path"}
+        # Check if query is trying to access a table that might not exist
+        if 'FROM ' in query.upper() and not query.upper().startswith('SELECT EXISTS'):
+            # Extract table name from query
+            table_match = re.search(r'FROM\s+([\w_]+)', query, re.IGNORECASE)
+            if table_match:
+                table_name = table_match.group(1)
+                # Check if table exists
+                table_exists = conn.execute(f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')").fetchone()[0]
+                if not table_exists:
+                    return {
+                        "status": "error", 
+                        "message": f"Table '{table_name}' does not exist in this log file. The data you're looking for may not be available."
+                    }
+        
+        # Execute query with optimized result handling
+        result = conn.execute(query).fetchall()
+        columns = [desc[0] for desc in conn.description] if conn.description else []
 
-        # Block dangerous SQL operations using regex for whole word matching
-        query_lower: str = query.lower().strip()
-        # Ensure keywords are treated as whole words and handle cases like `drop table` vs `drop_rate_comm`
-        dangerous_keywords = [
-            "drop",
-            "delete",
-            "update",
-            "insert",
-            "alter",
-            "create",
-            "truncate",
-        ]
-        for keyword in dangerous_keywords:
-            # denotes a word boundary
-            if re.search(r"\b" + re.escape(keyword) + r"\b", query_lower):
-                logger.error(
-                    "Potentially dangerous query detected due to keyword: ",
-                    query=query,
-                    keyword=keyword,
-                )
-                return {
-                    "status": "error",
-                    "message": f"Query contains prohibited keyword: {keyword}",
-                }
+        # Use list comprehension for better performance
+        data_to_return = [dict(zip(columns, row)) for row in result]
+        row_count = len(data_to_return)
 
-        with duckdb.connect(db_path, read_only=True) as conn:
-            result: List[tuple] = conn.execute(query).fetchall()
-            columns: List[str] = (
-                [desc[0] for desc in conn.description] if conn.description else []
-            )
-
-            data_to_return = [dict(zip(columns, row)) for row in result]
-            row_count = len(data_to_return)
-
-            # Return all results without truncation
-            return {"status": "success", "data": data_to_return, "row_count": row_count}
-    except KeyError as e:  # Should ideally be caught by Pydantic validation now
-        logger.error(
-            "query_duckdb missing expected keys after Pydantic validation (should not happen)",
-            parsed_args_dict=(
-                parsed_args.model_dump() if parsed_args else "parsed_args_is_None"
-            ),
-            missing_key=str(e),
-        )
-        return {
-            "status": "error",
-            "message": f"Internal error: Missing expected argument {str(e)} after validation",
-        }
+        # Store in cache
+        response = {"status": "success", "data": data_to_return, "row_count": row_count}
+        
+        # Manage cache size
+        if len(query_result_cache) >= MAX_QUERY_CACHE_SIZE:
+            # Remove oldest entry (first key)
+            oldest_key = next(iter(query_result_cache))
+            del query_result_cache[oldest_key]
+            
+        query_result_cache[cache_key] = response
+        return response
+        
     except duckdb.Error as e:
-        logger.error("DuckDB query execution failed", query=query, error_str=str(e))
         return {"status": "error", "message": f"Query failed: {str(e)}"}
     except Exception as e:
-        logger.error(
-            "Unexpected error during DuckDB query execution",
-            query=query,
-            error_str=str(e),
-            error_type=str(type(e)),
-        )
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
+# Function to clear caches if needed
+def clear_query_caches():
+    """Clear all query and connection caches."""
+    global query_result_cache, db_connection_cache
+    
+    # Close all database connections
+    for conn in db_connection_cache.values():
+        try:
+            conn.close()
+        except:
+            pass
+    
+    # Reset caches
+    query_result_cache = {}
+    db_connection_cache = {}
 
 class DetectAnomaliesMLInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
     table: str = Field(description="Name of the telemetry table")
     columns: List[str] = Field(description="Numerical columns to analyze")
-
 
 class DetectAnomaliesBatchInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")

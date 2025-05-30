@@ -1,4 +1,4 @@
-from typing import Dict, List, Any, Optional, Tuple, Set, Union
+from typing import Dict, List, Any, Optional, Tuple, Set
 import time
 import asyncio
 import pandas as pd
@@ -40,7 +40,6 @@ class AnomalyDetector:
     # Priority tables where anomalies are most likely to occur
     PRIORITY_TABLES = [
         "telemetry_attitude",  # Aircraft orientation (roll, pitch, yaw)
-        "telemetry_vfr_hud",  # Key flight data (airspeed, groundspeed, altitude)
         "telemetry_global_position_int",  # Position and velocity
         "telemetry_gps_raw_int",  # GPS data quality and accuracy
     ]
@@ -843,6 +842,9 @@ class AnomalyDetector:
                 "is_anomaly": bool(is_anomaly),
                 "anomaly_score": float(anomaly_scores[i]),
             }
+            # Include time_boot_ms if available
+            if "time_boot_ms" in df.columns:
+                result["time_boot_ms"] = int(df["time_boot_ms"].iloc[i])
             results.append(result)
             if is_anomaly:
                 anomaly_count += 1
