@@ -749,7 +749,7 @@ class AnomalyDetector:
         # Truncate results if too long
         final_row_count = len(df)
         if len(results) > MAX_TOOL_OUTPUT_ROWS:
-            self.logger.warning(
+            self.logger.debug(
                 f"Output truncated from {len(results)} to {MAX_TOOL_OUTPUT_ROWS} rows.",
                 table=table
             )

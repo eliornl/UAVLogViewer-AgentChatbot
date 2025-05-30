@@ -193,12 +193,7 @@ export default {
                 'List all critical errors that happened mid-flight.',
                 'When was the first instance of RC signal loss?',
                 'Are there any anomalies in this flight?',
-                'Can you spot any issues in the GPS data?',
-                'What was the average speed during the flight?',
-                'Show me a summary of this flight log.',
-                'What was the battery voltage at landing?',
-                'Were there any compass calibration issues?',
-                'What was the maximum distance from home point?'
+                'Can you spot any issues in the GPS data?'
             ],
             // Constants for template access
             MESSAGE_ROLES,

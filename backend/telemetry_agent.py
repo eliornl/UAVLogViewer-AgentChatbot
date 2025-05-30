@@ -107,10 +107,30 @@ Final Answer: the final answer to the original input question, grounded in the d
 1.  **Data-First & Tool-Driven:** Always start by using tools to get data. Conclusions MUST be based on data observed from tool outputs.
 2.  **Use `{tables}` Schema:** Consult the `{tables}` list for available tables and their exact column names. Only use existing columns.
 3.  **Verify Column Existence:** If a general strategy suggests a column, verify it exists in the `{tables}` schema for the specific table before querying it. If not, adapt your query or note its absence.
+4.  **CRITICAL TOOL SELECTION RULES:**
+    * ALWAYS use `detect_anomalies` (NOT query_duckdb) when analyzing issues, anomalies, problems, or quality of ANY system (GPS, attitude, position, etc.)
+    * Use `query_duckdb` ONLY for direct data retrieval like getting specific values, statistics, or filtered data
+    * When the query contains words like "issues", "anomalies", "problems", "glitches", "errors", "quality" - ALWAYS use detect_anomalies
+5.  **IMPORTANT COLUMN NAME CONVENTIONS:**
+    * Use `timestamp` (not `time_boot_ms`) for time-related queries in all tables
+    * Always check the exact column names in the `{tables}` list before constructing queries
+    * If you get a 'column not found' error, immediately check the schema and adjust your query
 
 **Main Analysis Strategy Decision:**
 
-*   **Is the query a broad request for "critical errors", "anomalies", "flight issues", "health check", or similar general problems?**
+*   **Is the query about a specific flight phase (takeoff, landing, mid-flight)?**
+    *   **YES:**
+        *   Thought: The user is asking about a specific flight phase. I need to determine the timestamp range for this phase and analyze data within that range.
+        *   **Step 1: Determine flight phase timestamp range.**
+            *   Action: `query_duckdb` to get min and max timestamps
+            *   Calculate phase boundaries based on percentages: Takeoff (0-25%), Mid-flight (25-75%), Landing (75-100%)
+        *   **Step 2: Analyze data within that phase.**
+            *   If the user mentioned a specific table, query only that table with the timestamp range filter
+            *   If no specific table was mentioned, query each of the PRIORITY_TABLES (telemetry_attitude, telemetry_vfr_hud, telemetry_global_position_int, telemetry_gps_raw_int) with the timestamp range
+            *   Use `query_duckdb` with appropriate WHERE clauses to filter by the timestamp range
+            *   Final Answer: Provide insights specific to the requested flight phase
+
+*   **Is the query a broad request for "critical errors", "anomalies", "flight issues", "problems", "warnings", "failures", "malfunctions", "incidents", "troubles", "concerns", "errors", "faults", "defects", "issues", or similar general problems?**
     *   **YES (Broad Query):** 
         *   Thought: The user's query is a broad request for general anomalies or errors. For this type of query, I will use the `detect_anomalies` tool which comprehensively analyzes all data in the most relevant tables.
         *   **Step 1: Use Anomaly Detection.**
@@ -122,8 +142,17 @@ Final Answer: the final answer to the original input question, grounded in the d
             
         *   **IMPORTANT: Trust the model results completely.** The anomaly detection model has been trained on all available data and focuses on the most relevant tables where anomalies are likely to occur. DO NOT perform additional queries to verify the model's findings. The model's results are sufficient and comprehensive.
 
-    *   **NO (Specific Query):**
-        *   Thought: The user's query is more specific and not a general request for anomalies. I will use the "Detailed Multi-Category Investigation" below, focusing on the categories and tables most relevant to the specific question.
+    *   **YES, BUT SPECIFIC TO ONE SYSTEM (e.g., "GPS issues", "attitude problems"):**
+        *   Thought: The user is asking about anomalies or issues in a specific system. I will use the `detect_anomalies` tool but focus on the relevant tables for that system.
+        *   **Step 1: Use Targeted Anomaly Detection.**
+            *   Action: `detect_anomalies` (Input: {{"db_path": "[path_to_db]", "tables": ["relevant_table_name"]}} )
+            *   Observation: [Results from `detect_anomalies` showing anomalies found in the specific table]
+        *   **Step 2: Synthesize and Conclude.**
+            *   Thought: I have received anomaly detection results for the specific system the user asked about.
+            *   Final Answer: Summarize ONLY the anomalies related to the specific system the user asked about. If no issues are found in that system, state that clearly.
+
+    *   **NO (Other Specific Query):**
+        *   Thought: The user's query is specific but not about anomalies or issues. I will use the "Detailed Multi-Category Investigation" below, focusing on the categories and tables most relevant to the specific question.
 
 
 **Detailed Multi-Category Investigation (for Specific Queries):**
@@ -216,36 +245,79 @@ class QueryDuckDBInput(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def _handle_potentially_nested_json_input(cls, data: Any) -> Any:
+        # Handle the case when the agent sends the input as a JSON string
+        if isinstance(data, str):
+            try:
+                parsed_data = json.loads(data)
+                if isinstance(parsed_data, dict):
+                    logger.info(f"{cls.__name__}: Input was a JSON string, parsed successfully")
+                    data = parsed_data
+            except json.JSONDecodeError:
+                logger.warning(f"{cls.__name__}: Input was a string but not valid JSON")
+                # Continue with original data
+        
         if isinstance(data, dict):
-            # Check if 'query' is missing and 'db_path' holds a string,
-            # which matches the observed error pattern.
+            # Case 1: Check if 'query' is missing and 'db_path' holds a string that might be JSON
             if 'query' not in data and 'db_path' in data and isinstance(data['db_path'], str):
                 db_path_value = data['db_path']
-                try:
-                    # Attempt to parse the string in 'db_path' as JSON
-                    parsed_json_from_db_path = json.loads(db_path_value)
-                    # Check if the parsed JSON is a dict and contains both 'db_path' and 'query'
-                    if isinstance(parsed_json_from_db_path, dict) and \
-                       'db_path' in parsed_json_from_db_path and \
-                       'query' in parsed_json_from_db_path:
-                        logger.info(
-                            f"{cls.__name__}: Input data appeared to have JSON string in 'db_path'. Expanding.",
-                            original_data_keys=list(data.keys()),
-                            parsed_json_keys=list(parsed_json_from_db_path.keys())
-                        )
-                        # Return the parsed JSON dictionary for Pydantic to use
-                        return parsed_json_from_db_path
-                except json.JSONDecodeError:
-                    # 'db_path' value was a string but not valid JSON, or not the structure we expected.
-                    # Log this, but let Pydantic handle the original 'data'.
-                    # This will likely lead to the original validation error if 'query' is truly missing.
+                
+                # Check if db_path looks like it might contain JSON (has curly braces)
+                if '{' in db_path_value and '}' in db_path_value:
+                    try:
+                        # Try to extract a complete JSON object
+                        first_brace = db_path_value.find('{')
+                        last_brace = db_path_value.rfind('}')
+                        if first_brace >= 0 and last_brace > first_brace:
+                            json_part = db_path_value[first_brace:last_brace+1]
+                            parsed_json = json.loads(json_part)
+                            
+                            if isinstance(parsed_json, dict):
+                                # Check if the parsed JSON has the expected structure
+                                if 'db_path' in parsed_json and 'query' in parsed_json:
+                                    logger.info(f"{cls.__name__}: Successfully extracted JSON from db_path")
+                                    return parsed_json
+                                # If it has query but not db_path, try to combine them
+                                elif 'query' in parsed_json and 'db_path' not in parsed_json:
+                                    # Extract the actual db_path from the beginning of the string
+                                    actual_db_path = db_path_value.split('{')[0].strip()
+                                    if actual_db_path.endswith('.duckdb'):
+                                        parsed_json['db_path'] = actual_db_path
+                                        logger.info(f"{cls.__name__}: Combined db_path with query from JSON")
+                                        return parsed_json
+                    except json.JSONDecodeError:
+                        # Not valid JSON, try other approaches
+                        pass
+                    
+                    # If JSON parsing failed, try to extract query directly if it's in a multi-line format
+                    if '"query":' in db_path_value or "'query':" in db_path_value:
+                        try:
+                            # Extract the query part
+                            query_start = max(db_path_value.find('"query":'), db_path_value.find("'query':"))
+                            if query_start > 0:
+                                # Find the actual query content
+                                content_start = db_path_value.find('"""', query_start)
+                                if content_start > 0:
+                                    content_end = db_path_value.find('"""', content_start + 3)
+                                    if content_end > 0:
+                                        query_content = db_path_value[content_start+3:content_end].strip()
+                                        # Extract the actual db_path from the beginning of the string
+                                        actual_db_path = db_path_value.split('{')[0].strip()
+                                        if actual_db_path.endswith('.duckdb'):
+                                            logger.info(f"{cls.__name__}: Extracted multi-line query and db_path")
+                                            return {
+                                                'db_path': actual_db_path,
+                                                'query': query_content
+                                            }
+                        except Exception as e:
+                            logger.warning(f"{cls.__name__}: Failed to extract multi-line query", error=str(e))
+                            pass
+                    
+                    # Log the failure
                     logger.warning(
                         f"{cls.__name__}: 'db_path' contained a string that was not parsable " +
                         "into the expected {{'db_path': ..., 'query': ...}} structure.",
                         db_path_value_snippet=db_path_value[:100] # Log a snippet for diagnosis
                     )
-                    # Fall through to return original data, allowing standard Pydantic validation to proceed
-                    pass
         # If not the specific scenario identified, or if correction failed, return data as is.
         return data
 
@@ -355,36 +427,42 @@ class DetectAnomaliesBatchInput(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def check_values(cls, data: Any) -> Any:
+        # Handle the case when the agent sends the input as a JSON string
+        if isinstance(data, str):
+            try:
+                parsed_data = json.loads(data)
+                if isinstance(parsed_data, dict):
+                    logger.info(f"{cls.__name__}: Input was a JSON string, parsed successfully")
+                    data = parsed_data
+            except json.JSONDecodeError:
+                logger.warning(f"{cls.__name__}: Input was a string but not valid JSON")
+                # Continue with original data
+        
         if isinstance(data, dict):
-            # Check for the specific nested JSON pattern for this model
-            # i.e. table and columns are missing, and db_path is a string that might be JSON
-            if ('table' not in data and 
-                'columns' not in data and 
-                'db_path' in data and 
-                isinstance(data['db_path'], str)):
+            # If db_path is a JSON string (common error from agents), try to parse it
+            if 'db_path' in data and isinstance(data['db_path'], str):
+                db_path = data['db_path']
                 
-                potential_json_str = data['db_path']
-                try:
-                    parsed_json = json.loads(potential_json_str)
-                    # Check if the parsed JSON has the expected keys for DetectAnomaliesMLInput
-                    if (isinstance(parsed_json, dict) and
-                        'db_path' in parsed_json and
-                        'table' in parsed_json and
-                        'columns' in parsed_json):
-                        logger.info(
-                            f"{cls.__name__}: Input data appeared to have JSON string in 'db_path'. Expanding.",
-                            original_data_keys=list(data.keys()),
-                            parsed_json_keys=list(parsed_json.keys())
-                        )
-                        return parsed_json # Return the parsed dict for Pydantic to validate
-                except json.JSONDecodeError:
-                    logger.warning(
-                        f"{cls.__name__}: 'db_path' contained a string that was not parsable " +
-                        "into the expected structure for DetectAnomaliesMLInput.",
-                        db_path_value_snippet=potential_json_str[:100]
-                    )
-                    # Fall through to return original data, Pydantic will likely raise validation error
-                    pass
+                # Check if db_path looks like it might contain JSON (has curly braces)
+                if '{' in db_path and '}' in db_path:
+                    try:
+                        # Try to extract a complete JSON object
+                        first_brace = db_path.find('{')
+                        last_brace = db_path.rfind('}')
+                        if first_brace >= 0 and last_brace > first_brace:
+                            json_part = db_path[first_brace:last_brace+1]
+                            parsed_json = json.loads(json_part)
+                            
+                            if isinstance(parsed_json, dict) and 'db_path' in parsed_json:
+                                logger.info(f"{cls.__name__}: Successfully extracted JSON from db_path")
+                                # Merge the parsed JSON with the original data
+                                # but keep the original db_path if the parsed one doesn't look like a path
+                                if not parsed_json['db_path'].endswith('.duckdb'):
+                                    parsed_json['db_path'] = db_path.split('{')[0].strip()
+                                return parsed_json
+                    except json.JSONDecodeError:
+                        # Not valid JSON, continue with original data
+                        pass
         return data
 
 # Global instance of AnomalyDetector for the anomaly detection functions
@@ -417,18 +495,25 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
         try:
             # Try to clean up the input if it contains multiple JSON objects
             if tool_input.count('{') > 1 and tool_input.count('}') > 1:
-                # Find the first complete JSON object
+                # Find the first and last braces for a complete JSON object
                 first_open = tool_input.find('{')
-                first_close = tool_input.find('}')
-                if first_open >= 0 and first_close > first_open:
-                    # Extract just the first JSON object
-                    clean_input = tool_input[first_open:first_close+1]
-                    logger.warning(f"Detected multiple JSON objects in input, using only the first one: {clean_input}")
+                last_close = tool_input.rfind('}')
+                if first_open >= 0 and last_close > first_open:
+                    # Extract the entire string between first { and last }
+                    clean_input = tool_input[first_open:last_close+1]
+                    logger.warning(f"Detected multiple JSON objects in input, attempting to parse complete JSON: {clean_input}")
                     try:
                         args_dict = json.loads(clean_input)
                     except json.JSONDecodeError:
-                        # If that fails, try the original input
-                        args_dict = json.loads(tool_input)
+                        # If that fails, try finding just the first complete JSON object
+                        first_close = tool_input.find('}')
+                        if first_close > first_open:
+                            clean_input = tool_input[first_open:first_close+1]
+                            logger.warning(f"Trying first JSON object only: {clean_input}")
+                            args_dict = json.loads(clean_input)
+                        else:
+                            # Last resort: try the original input
+                            args_dict = json.loads(tool_input)
                 else:
                     args_dict = json.loads(tool_input)
             else:
@@ -491,7 +576,43 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
             tables_skipped=len(result.get("tables_skipped", [])),
             anomalies_found=result.get("anomalies_found", 0)
         )
-        return result
+        
+        # Extract essential metrics for structured logging
+        tables_processed = len(result.get('tables_processed', []))
+        anomalies_found = result.get('anomalies_found', 0)
+        total_rows = result.get('total_rows_analyzed', 0)
+        
+        # Log the detailed results for debugging purposes, but don't return them
+        logger.debug("Full anomaly detection result", 
+                    result=json.dumps(result, default=str),
+                    tables_processed=tables_processed,
+                    anomalies_found=anomalies_found,
+                    total_rows=total_rows)
+        
+        # Create an ultra-minimal version with only what the agent needs
+        # This preserves just enough structure for the agent while drastically reducing size
+        simplified_result = {
+            
+            "status": result.get("status", ""),
+            "summary": f"Anomaly detection completed on {tables_processed} tables. Found {anomalies_found} anomalies across {total_rows} rows.",
+            "anomalies_found": anomalies_found,
+            "tables_summary": []
+        
+        }
+        
+        # Add only the most essential details for each table
+        for table_name, table_result in result.get("results", {}).items():
+            table_anomalies = table_result.get("anomaly_count", 0)
+            # Only include tables with anomalies to further reduce size
+            if table_anomalies > 0:
+                simplified_result["tables_summary"].append({
+                
+                    "table": table_name,
+                    "anomalies": table_anomalies
+                })
+        
+        # Return the simplified result - still structured but much smaller
+        return simplified_result
         
     except ValidationError as e:
         logger.error("Validation error in detect_anomalies", error=str(e))
@@ -514,6 +635,10 @@ query_duckdb_tool: StructuredTool = StructuredTool.from_function(
         "Parameters: db_path (string, path to database), query (string, SQL query). "
         "Example: query_duckdb(db_path='/path/to/db.duckdb', query='SELECT AVG(altitude) FROM telemetry_global_position'). "
         "Returns query results with status, data, and row_count. "
+        "\n\nWHEN TO USE THIS TOOL:\n"
+        "- Use for DIRECT DATA RETRIEVAL when you need specific values, statistics, or filtered data\n"
+        "- DO NOT use for anomaly detection, critical errors, or identifying unusual patterns - use detect_anomalies tool instead\n"
+        "- Good for: altitude measurements, speed calculations, position tracking, etc.\n"
         "\n\nWhen discussing query results, always provide context about tables and columns: "
         "\n- When mentioning a specific table (e.g., 'telemetry_attitude'), explain what kind of data this table contains (e.g., 'the telemetry_attitude table contains vehicle orientation data including roll, pitch, and yaw angles'). "
         "\n- When mentioning specific columns (e.g., 'roll'), explain what this column represents and its unit of measurement (e.g., 'the roll column represents the aircraft's roll angle measured in degrees'). "
@@ -534,7 +659,16 @@ detect_anomalies_tool: StructuredTool = StructuredTool.from_function(
         "Parameters: db_path (string), tables (optional list of table names). "
         "Example: detect_anomalies(db_path='/path/to/db.duckdb') or detect_anomalies(db_path='/path/to/db.duckdb', tables=['telemetry_attitude', 'telemetry_gps_raw_int']). "
         "If tables parameter is omitted, will use priority tables (attitude, position, GPS, etc). "
-        "Returns combined results across all processed tables. Use this for broad anomaly queries across the entire dataset. "
+        "Returns combined results across all processed tables. "
+        "\n\nWHEN TO USE THIS TOOL:\n"
+        "1. For SPECIFIC ANOMALIES in a particular system: Use when the query mentions anomalies, issues, problems, or errors with a specific component (e.g., 'GPS anomalies', 'attitude issues', 'battery problems'). Specify the relevant table in the 'tables' parameter. When reporting results, ONLY include anomalies from the specific system the user asked about.\n"
+        "2. For BROAD FLIGHT ANOMALIES: Use when the query asks about overall flight anomalies, critical errors, unusual patterns, or issues across the entire flight (e.g., 'list all critical errors', 'find anomalies during mid-flight', 'what went wrong during the flight'). In this case, don't specify tables to analyze all priority tables.\n"
+        "3. ALWAYS USE THIS TOOL (not query_duckdb) when looking for critical errors, warnings, or unusual patterns in the flight data.\n"
+        "4. IMPORTANT: If the user asks about issues in a specific system (e.g., GPS), even if you run the tool on all tables, your response should ONLY discuss the anomalies relevant to the system they asked about.\n"
+        "5. CRITICAL GPS EXAMPLES: ALWAYS use this tool (NEVER query_duckdb) for ANY of these queries:\n"
+        "   - 'Analyze GPS data for issues' → Use detect_anomalies with tables=['telemetry_gps_raw_int']\n"
+        "   - 'Check GPS quality' → Use detect_anomalies with tables=['telemetry_gps_raw_int']\n"
+        "   - 'Find GPS fix problems' → Use detect_anomalies with tables=['telemetry_gps_raw_int']\n"
         "\n\nWhen discussing results, always provide context about tables and columns: "
         "\n- When mentioning a specific table (e.g., 'telemetry_attitude'), explain what kind of data this table contains (e.g., 'the telemetry_attitude table contains vehicle orientation data including roll, pitch, and yaw angles'). "
         "\n- When mentioning specific columns (e.g., 'roll'), explain what this column represents and its unit of measurement (e.g., 'the roll column represents the aircraft's roll angle measured in degrees'). "
