@@ -2,8 +2,12 @@ from typing import List, Tuple, Any, Callable
 from langchain_core.messages import BaseMessage
 import tiktoken
 import structlog
+from functools import lru_cache
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+# Token cache size - adjust based on memory constraints
+TOKEN_CACHE_SIZE = 100
 
 
 class LLMTokenCounter:
@@ -89,7 +93,7 @@ class LLMTokenCounter:
             # Count tokens for user content
             if user_content:
                 try:
-                    total_tokens += len(self.encoding.encode(user_content))
+                    total_tokens += len(self._cached_encode(user_content))
                 except Exception as e:
                     logger.error(
                         "Failed to encode user content at index",
@@ -103,7 +107,7 @@ class LLMTokenCounter:
             # Count tokens for assistant content
             if assistant_content:
                 try:
-                    total_tokens += len(self.encoding.encode(assistant_content))
+                    total_tokens += len(self._cached_encode(assistant_content))
                 except Exception as e:
                     logger.error(
                         "Failed to encode assistant content at index",
@@ -144,17 +148,20 @@ class LLMTokenCounter:
 
             # Handle different content types
             if isinstance(content, str):
-                return len(self.encoding.encode(content))
+                # Use cached encoding for better performance
+                return len(self._cached_encode(content))
             elif isinstance(content, list):
                 # For multi-modal content, only count text parts
                 total = 0
                 for item in content:
                     if isinstance(item, dict) and item.get("type") == "text":
-                        total += len(self.encoding.encode(item.get("text", "")))
+                        text = item.get("text", "")
+                        # Use cached encoding for better performance
+                        total += len(self._cached_encode(text))
                 return total
             else:
                 # For other types, convert to string and count
-                return len(self.encoding.encode(str(content)))
+                return len(self._cached_encode(str(content)))
         except Exception as e:
             logger.error("Failed to count tokens in message", error=str(e))
             # Return a safe default value instead of raising an exception
@@ -179,9 +186,11 @@ class LLMTokenCounter:
             raise TypeError("Text must be a string")
 
         try:
-            tokens = self.encoding.encode(text)
+            # Use cached encoding for common inputs
+            tokens = self._cached_encode(text)
             logger.debug(
-                "Encoded text", model_name=self.model_name, token_count=len(tokens)
+                "Encoded text", model_name=self.model_name, token_count=len(tokens), 
+                cached=True
             )
             return tokens
         except Exception as e:
@@ -189,3 +198,15 @@ class LLMTokenCounter:
                 "Failed to encode text", model_name=self.model_name, error=str(e)
             )
             raise ValueError(f"Failed to encode text: {str(e)}") from e
+            
+    @lru_cache(maxsize=TOKEN_CACHE_SIZE)
+    def _cached_encode(self, text: str) -> List[int]:
+        """Cached version of token encoding for performance.
+        
+        Args:
+            text: Text to encode.
+            
+        Returns:
+            List[int]: List of token IDs.
+        """
+        return self.encoding.encode(text)

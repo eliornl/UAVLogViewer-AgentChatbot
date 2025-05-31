@@ -41,7 +41,12 @@ MAX_MODEL_TOKENS: int = 8192  # Maximum tokens for LLM input/output
 RESERVED_RESPONSE_TOKENS: int = 1024  # Tokens reserved for LLM response
 MAX_TOKEN_SAFETY_LIMIT: int = 16384  # Absolute token limit for safety
 FALLBACK_TOKEN_FACTOR: int = 2  # Factor to reduce context tokens if needed
+MEMORY_WARNING_THRESHOLD: float = 0.8  # Warn at 80% of memory/token limit
 
+# Memory monitoring settings
+MEMORY_CHECK_ENABLED: bool = True  # Toggle memory monitoring
+
+# Vector retriever settings
 # LLM configuration constants
 LLM_TEMPERATURE: float = 0.0  # LLM temperature for deterministic responses
 VECTOR_RETRIEVER_K: int = 4  # Number of vector store search results
@@ -52,7 +57,8 @@ CHAT_TIMEOUT_SECONDS: float = 60.0  # Timeout for agent processing, including ML
 
 # Output formatting constants
 MAX_TOOL_OUTPUT_ROWS: int = 50  # Max rows for query_duckdb and detect_anomalies output
-EARLY_TRUNCATION: bool = True  # Enable early truncation of results for better performance
+EARLY_TRUNCATION: bool = True  # Re-enabled after fixing sync wrapper issues
+SLIDING_WINDOW_EXCHANGES: int = 4  # Match window size from conversation_memory_manager.py
 
 # Error message constants
 ERROR_EMPTY_MESSAGE: str = "Empty message provided, skipping processing"
@@ -1243,21 +1249,26 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
 def query_duckdb_sync(tool_input: Any) -> Dict[str, Any]:
     """Synchronous wrapper for async query_duckdb function."""
     import asyncio
+    import threading
+    
+    def run_async():
+        """Run the async function in a new event loop."""
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        try:
+            return new_loop.run_until_complete(query_duckdb(tool_input))
+        finally:
+            new_loop.close()
+    
     try:
-        # Get the current event loop if one exists
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # If we're already in an async context, we need to run in a thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, query_duckdb(tool_input))
-                return future.result()
-        else:
-            # If no loop is running, we can run directly
-            return asyncio.run(query_duckdb(tool_input))
-    except RuntimeError:
-        # Fallback for when there's no event loop
-        return asyncio.run(query_duckdb(tool_input))
+        # Always run in a separate thread to avoid event loop conflicts
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(run_async)
+            return future.result(timeout=30)  # 30 second timeout
+    except Exception as e:
+        logger.error(f"Error in sync wrapper: {str(e)}")
+        return {"status": "error", "message": f"Query execution failed: {str(e)}"}
 
 # Register tools for LangChain - using sync wrapper for async functions
 query_duckdb_tool: StructuredTool = StructuredTool.from_function(
@@ -1660,6 +1671,7 @@ class TelemetryAgent:
             asyncio.TimeoutError: If processing exceeds CHAT_TIMEOUT_SECONDS.
             RuntimeError: If agent components are not properly initialized.
         """
+
         # Validate input message
         if not message.strip():
             self.logger.warning(ERROR_EMPTY_MESSAGE)
@@ -1723,6 +1735,15 @@ class TelemetryAgent:
                 await self.conversation_memory_manager.aget_memory()
             )
             chat_history_messages = memory.load_memory_variables({}).get("history", [])
+            
+            # Log conversation memory size for monitoring
+            if chat_history_messages:
+                self.logger.debug(
+                    "Conversation history size",
+                    current_size=len(chat_history_messages),
+                    max_size=SLIDING_WINDOW_EXCHANGES,
+                    memory_strategy=memory_strategy.value
+                )
 
             # Format chat_history_messages into a string for the prompt
             chat_history_string = ""
@@ -1884,14 +1905,29 @@ class TelemetryAgent:
             }
 
             # Monitor scratchpad size - aggressive retention is now handled at scratchpad level
+            # Manage custom scratchpad size to prevent token limit issues
             scratchpad_tokens = len(
                 self.token_encoder.encode(current_custom_scratchpad)
             )
+            
+            # Calculate token usage percentage for early warning
+            token_percentage = (scratchpad_tokens / self.max_context_tokens)
+            formatted_percentage = f"{token_percentage * 100:.1f}%"
+            
+            # Log scratchpad token usage for monitoring
+            if token_percentage > MEMORY_WARNING_THRESHOLD:
+                self.logger.debug(
+                    "Scratchpad token usage high",
+                    tokens=scratchpad_tokens,
+                    max_context_tokens=self.max_context_tokens,
+                    token_percentage=formatted_percentage
+                )
+            
             self.logger.debug(
                 "Scratchpad token usage",
                 tokens=scratchpad_tokens,
                 max_context_tokens=self.max_context_tokens,
-                token_percentage=f"{(scratchpad_tokens / self.max_context_tokens) * 100:.1f}%",
+                token_percentage=formatted_percentage,
                 steps_retained=len(self.scratchpad.intermediate_steps)
             )
             
@@ -1917,6 +1953,15 @@ class TelemetryAgent:
                 metadata_token_usage=metadata["token_usage"],
                 metadata_is_clarification=metadata["is_clarification"],
             )
+            
+            # Simple memory monitoring without external dependencies
+            if MEMORY_CHECK_ENABLED:
+                self.logger.debug(
+                    "Processing completed successfully",
+                    response_length=len(response),
+                    session_id=self.session_id
+                )
+            
             return response, metadata
 
         except asyncio.TimeoutError:
