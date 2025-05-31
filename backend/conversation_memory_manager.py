@@ -89,7 +89,7 @@ class CustomBufferWindowMemory(BaseMemory):
         This method retrieves the most recent messages from the chat history,
         preserving any system message at the beginning. It uses the trim_messages
         function to select messages while maintaining conversation integrity.
-        
+
         The sliding window approach ensures we only keep the last 4 exchanges (8 messages)
         to prevent context bloat and improve performance.
 
@@ -102,7 +102,7 @@ class CustomBufferWindowMemory(BaseMemory):
                                 not fully implemented
         """
         messages = self.chat_memory.messages
-                
+
         # Use token counter if provided, otherwise fall back to message count
         token_counter_fn = self.token_counter
         max_tokens = self.max_token_limit
@@ -274,7 +274,7 @@ class ConversationMemoryManager:
         """
         try:
             user_content, assistant_content = message_pair
-            
+
             # First, always add the message to the current memory object
             self.memory.chat_memory.add_user_message(user_content)
             self.memory.chat_memory.add_ai_message(assistant_content)
@@ -288,7 +288,11 @@ class ConversationMemoryManager:
                     self.history = self.history[-SLIDING_WINDOW_EXCHANGES:]
                     self.logger.info(
                         "Applied sliding window memory - removed oldest message",
-                        removed_message=removed[0][:30] + "..." if len(removed[0]) > 30 else removed[0],
+                        removed_message=(
+                            removed[0][:30] + "..."
+                            if len(removed[0]) > 30
+                            else removed[0]
+                        ),
                         window_size=SLIDING_WINDOW_EXCHANGES,
                     )
                 self.llm_token_count += msg_tokens

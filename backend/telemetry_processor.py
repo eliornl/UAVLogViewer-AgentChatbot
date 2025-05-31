@@ -269,7 +269,9 @@ class TelemetryProcessor:
                             )
                             """
                             try:
-                                await asyncio.to_thread(lambda: conn.execute(create_table_query))
+                                await asyncio.to_thread(
+                                    lambda: conn.execute(create_table_query)
+                                )
                             except Exception as e:
                                 session_logger.error(
                                     "Failed to create table",
@@ -302,7 +304,7 @@ class TelemetryProcessor:
                             row_count=len(df),
                         )
                         await asyncio.to_thread(lambda: conn.commit())
-                        
+
                         # Note: Indexes for time_boot_ms are created separately via
                         # create_time_boot_ms_indexes() to avoid timeouts during initial data load
 
@@ -358,21 +360,23 @@ class TelemetryProcessor:
                 exc_info=True,
             )
             raise ValueError(TelemetryProcessor.UNEXPECTED_ERROR.format(str(e))) from e
-            
+
     @staticmethod
-    async def create_time_boot_ms_indexes(session: Session, storage_dir: str, db_prefix: str) -> None:
+    async def create_time_boot_ms_indexes(
+        session: Session, storage_dir: str, db_prefix: str
+    ) -> None:
         """Create indexes on time_boot_ms columns for all tables that contain this field.
-        
+
         This method should be called separately from parse_and_save to avoid timeouts during
         initial data loading. It creates an index on the time_boot_ms column for each table
         that contains this field, improving query performance for time-based filtering.
-        
+
         The method is designed to be non-blocking and fault-tolerant:
         - It will not raise exceptions if index creation fails
         - It logs errors but allows the application to continue
         - It uses a single database transaction for efficiency
         - It has a timeout to prevent hanging
-        
+
         Args:
             session: Session object containing session_id and other metadata.
             storage_dir: Directory where DuckDB files are stored.
@@ -383,28 +387,34 @@ class TelemetryProcessor:
         )
         try:
             # Prepare DuckDB database path
-            db_path = os.path.join(storage_dir, f"{db_prefix}{session.session_id}.duckdb")
+            db_path = os.path.join(
+                storage_dir, f"{db_prefix}{session.session_id}.duckdb"
+            )
             if ".." in os.path.relpath(db_path, storage_dir):
                 session_logger.error("Invalid database path", db_path=db_path)
-                raise ValueError(TelemetryProcessor.INVALID_DB_PATH_ERROR.format(db_path))
-                
+                raise ValueError(
+                    TelemetryProcessor.INVALID_DB_PATH_ERROR.format(db_path)
+                )
+
             # Define function to create indexes
             async def create_indexes() -> None:
                 with duckdb.connect(db_path) as conn:
                     # Get list of all tables with time_boot_ms column in a single query
                     table_columns = await asyncio.to_thread(
-                        lambda: conn.execute("""
+                        lambda: conn.execute(
+                            """
                             SELECT t.table_name, c.column_name 
                             FROM duckdb_tables() t 
                             JOIN duckdb_columns() c ON t.table_name = c.table_name 
                             WHERE t.table_name LIKE 'telemetry_%' 
                             AND c.column_name = 'time_boot_ms'
-                        """).fetchall()
+                        """
+                        ).fetchall()
                     )
-                    
+
                     # Create a single transaction for all indexes
                     await asyncio.to_thread(lambda: conn.execute("BEGIN TRANSACTION"))
-                    
+
                     created_count = 0
                     for table_name, _ in table_columns:
                         try:
@@ -412,52 +422,46 @@ class TelemetryProcessor:
                             index_name = f"{table_name}_time_boot_ms_idx"
                             await asyncio.to_thread(
                                 lambda: conn.execute(
-                                    f"CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\"(time_boot_ms)"
+                                    f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{table_name}"(time_boot_ms)'
                                 )
                             )
                             created_count += 1
                             session_logger.debug(
                                 "Created index on time_boot_ms column",
                                 table_name=table_name,
-                                index_name=index_name
+                                index_name=index_name,
                             )
                         except Exception as e:
                             session_logger.warning(
                                 "Failed to create index",
                                 table_name=table_name,
-                                error=str(e)
+                                error=str(e),
                             )
                             # Continue with other tables even if this one fails
-                    
+
                     # Commit all index creations at once
                     await asyncio.to_thread(lambda: conn.execute("COMMIT"))
-                    
+
                     session_logger.info(
                         "Created time_boot_ms indexes",
                         created_count=created_count,
-                        total_tables=len(table_columns)
+                        total_tables=len(table_columns),
                     )
-            
+
             # Execute index creation with timeout
             await asyncio.wait_for(
-                create_indexes(),
-                timeout=120.0  # 2 minutes timeout for index creation
+                create_indexes(), timeout=120.0  # 2 minutes timeout for index creation
             )
-            
+
         except asyncio.TimeoutError as e:
             session_logger.error(
-                "Index creation timed out",
-                error=str(e),
-                timeout_seconds=120.0
+                "Index creation timed out", error=str(e), timeout_seconds=120.0
             )
             # Don't raise the exception, just log it
             # This allows the application to continue even if index creation fails
             return
         except (OSError, duckdb.IOException) as e:
-            session_logger.error(
-                "Database error during index creation",
-                error=str(e)
-            )
+            session_logger.error("Database error during index creation", error=str(e))
             # Don't raise the exception, just log it
             return
         except Exception as e:
@@ -465,7 +469,7 @@ class TelemetryProcessor:
                 "Unexpected error during index creation",
                 error_type=type(e).__name__,
                 error=str(e),
-                exc_info=True
+                exc_info=True,
             )
             # Don't raise the exception, just log it
             return

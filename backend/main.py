@@ -10,7 +10,15 @@ from json import JSONEncoder
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Set, Optional, AsyncGenerator, Tuple, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, status, Response, BackgroundTasks
+from fastapi import (
+    FastAPI,
+    UploadFile,
+    File,
+    HTTPException,
+    status,
+    Response,
+    BackgroundTasks,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -59,7 +67,9 @@ CSV_MEDIA_TYPE: str = "text/csv"
 MAX_MESSAGES: int = 10_000  # Limit messages per session to prevent memory issues
 MAX_SESSIONS: int = 1000  # Maximum number of concurrent sessions allowed
 MAX_SESSION_ATTEMPTS: int = 5  # Maximum attempts to generate a unique session ID
-CHAT_TIMEOUT_SECONDS: float = 15.0  # Timeout for chat message processing (reduced for faster error recovery)
+CHAT_TIMEOUT_SECONDS: float = (
+    15.0  # Timeout for chat message processing (reduced for faster error recovery)
+)
 
 # File naming constants
 FILENAME_SAFE_CHARS: str = (
@@ -387,7 +397,9 @@ async def create_session(
 
 
 @app.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()) -> UploadResponse:
+async def upload_file(
+    file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()
+) -> UploadResponse:
     """Upload a flight log file, parse it, and create a new session.
 
     Args:
@@ -467,19 +479,19 @@ async def upload_file(file: UploadFile = File(...), background_tasks: Background
                 await TelemetryProcessor.parse_and_save(
                     tmp_file_path, session, STORAGE_DIR, DUCKDB_FILE_PREFIX
                 )
-                
+
                 # Add index creation as a background task
                 background_tasks.add_task(
                     TelemetryProcessor.create_time_boot_ms_indexes,
                     session,
                     STORAGE_DIR,
-                    DUCKDB_FILE_PREFIX
+                    DUCKDB_FILE_PREFIX,
                 )
                 session_logger.info(
                     "Added time_boot_ms index creation to background tasks",
-                    session_id=session_id
+                    session_id=session_id,
                 )
-                
+
                 session_logger.info(
                     "Session processing completed",
                     session_status=session.status,
@@ -1082,7 +1094,9 @@ async def get_messages(session_id: str) -> List[Dict[str, Any]]:
         return messages
 
 
-@app.post("/session/{session_id}/delete", response_model=DeleteSessionResponse)  # Endpoint for session deletion via beacon
+@app.post(
+    "/session/{session_id}/delete", response_model=DeleteSessionResponse
+)  # Endpoint for session deletion via beacon
 async def delete_session(session_id: str) -> DeleteSessionResponse:
     """Delete a session, its agent, and associated DuckDB file.
 

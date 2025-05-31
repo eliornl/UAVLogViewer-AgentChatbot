@@ -51,7 +51,9 @@ class VectorStoreManager:
         _cache_ttl: Time-to-live for cache entries in seconds.
     """
 
-    def __init__(self, embeddings: OpenAIEmbeddings, cache_ttl_seconds: float = CACHE_TTL_SECONDS) -> None:
+    def __init__(
+        self, embeddings: OpenAIEmbeddings, cache_ttl_seconds: float = CACHE_TTL_SECONDS
+    ) -> None:
         """Initialize VectorStoreManager with embeddings and caching.
 
         Args:
@@ -97,7 +99,8 @@ class VectorStoreManager:
         """Remove expired cache entries to prevent memory bloat."""
         current_time = time.time()
         expired_keys = [
-            key for key, (_, timestamp) in self._search_cache.items()
+            key
+            for key, (_, timestamp) in self._search_cache.items()
             if (current_time - timestamp) >= self._cache_ttl
         ]
 
@@ -110,7 +113,7 @@ class VectorStoreManager:
             self.logger.debug(
                 "Cleaned up expired cache entries",
                 expired_count=len(expired_keys),
-                remaining_count=len(self._search_cache)
+                remaining_count=len(self._search_cache),
             )
 
     def clear_cache(self) -> None:
@@ -128,14 +131,15 @@ class VectorStoreManager:
         """
         current_time = time.time()
         valid_entries = sum(
-            1 for _, timestamp in self._search_cache.values()
+            1
+            for _, timestamp in self._search_cache.values()
             if (current_time - timestamp) < self._cache_ttl
         )
 
         return {
             "total_entries": len(self._search_cache),
             "valid_entries": valid_entries,
-            "expired_entries": len(self._search_cache) - valid_entries
+            "expired_entries": len(self._search_cache) - valid_entries,
         }
 
     async def initialize(
@@ -239,7 +243,7 @@ class VectorStoreManager:
                     "Returning cached similarity search results",
                     query=query,
                     result_count=len(cached_results),
-                    cache_age_seconds=time.time() - timestamp
+                    cache_age_seconds=time.time() - timestamp,
                 )
                 return cached_results
             else:
@@ -274,20 +278,22 @@ class VectorStoreManager:
             # Cache the results with LRU eviction
             self._search_cache[cache_key] = (results, time.time())
             self._cache_access_order.append(cache_key)
-            
+
             # Enforce cache size limit with LRU eviction
             while len(self._search_cache) > MAX_CACHE_SIZE:
                 oldest_key = self._cache_access_order.pop(0)
                 if oldest_key in self._search_cache:
                     del self._search_cache[oldest_key]
-                    self.logger.debug("Evicted cache entry due to size limit", evicted_key=oldest_key)
+                    self.logger.debug(
+                        "Evicted cache entry due to size limit", evicted_key=oldest_key
+                    )
 
             self.logger.debug(
                 "Performed vector store similarity search and cached results",
                 query=query,
                 result_count=len(results),
                 cache_size=len(self._search_cache),
-                max_cache_size=MAX_CACHE_SIZE
+                max_cache_size=MAX_CACHE_SIZE,
             )
             return results
         except asyncio.TimeoutError:

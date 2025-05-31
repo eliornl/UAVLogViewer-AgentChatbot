@@ -189,8 +189,10 @@ class LLMTokenCounter:
             # Use cached encoding for common inputs
             tokens = self._cached_encode(text)
             logger.debug(
-                "Encoded text", model_name=self.model_name, token_count=len(tokens), 
-                cached=True
+                "Encoded text",
+                model_name=self.model_name,
+                token_count=len(tokens),
+                cached=True,
             )
             return tokens
         except Exception as e:
@@ -198,14 +200,14 @@ class LLMTokenCounter:
                 "Failed to encode text", model_name=self.model_name, error=str(e)
             )
             raise ValueError(f"Failed to encode text: {str(e)}") from e
-            
+
     @lru_cache(maxsize=TOKEN_CACHE_SIZE)
     def _cached_encode(self, text: str) -> List[int]:
         """Cached version of token encoding for performance.
-        
+
         Args:
             text: Text to encode.
-            
+
         Returns:
             List[int]: List of token IDs.
         """

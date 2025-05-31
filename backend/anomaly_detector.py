@@ -223,7 +223,9 @@ class AnomalyDetector:
                             try:
                                 # Test if column is numerical
                                 await asyncio.to_thread(
-                                    lambda: conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                                    lambda: conn.execute(
+                                        f"SELECT AVG({col}) FROM {table} LIMIT 1"
+                                    )
                                 )
                                 numerical_cols.append(col)
                             except:
@@ -358,7 +360,9 @@ class AnomalyDetector:
                     try:
                         # Test if column is numerical
                         await asyncio.to_thread(
-                            lambda: conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                            lambda: conn.execute(
+                                f"SELECT AVG({col}) FROM {table} LIMIT 1"
+                            )
                         )
                         numerical_columns.append(col)
                     except:
@@ -398,7 +402,7 @@ class AnomalyDetector:
             max_rows (int): Maximum number of rows to analyze
             contamination (float): Expected proportion of anomalies
             wait_for_model (bool): Whether to wait for model training to complete before analyzing
-            time_boot_ms_range (Dict[str, int], optional): Time range to filter results 
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results
                                                           with format {'start': start_ms, 'end': end_ms}
 
         Returns:
@@ -452,17 +456,30 @@ class AnomalyDetector:
                 f"Using cached model for table {table}", columns=numerical_columns
             )
             return await self._apply_cached_model(
-                table, numerical_columns, cached_model_info, max_rows, time_boot_ms_range
+                table,
+                numerical_columns,
+                cached_model_info,
+                max_rows,
+                time_boot_ms_range,
             )
 
         # No cached model, create a new one
         return await self._create_and_apply_model(
-            table, numerical_columns, max_rows, contamination, wait_for_model, time_boot_ms_range
+            table,
+            numerical_columns,
+            max_rows,
+            contamination,
+            wait_for_model,
+            time_boot_ms_range,
         )
 
     async def _apply_cached_model(
-        self, table: str, columns: List[str], model_info: Dict[str, Any], max_rows: int,
-        time_boot_ms_range: Optional[Dict[str, int]] = None
+        self,
+        table: str,
+        columns: List[str],
+        model_info: Dict[str, Any],
+        max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """Apply a cached model to detect anomalies.
 
@@ -660,8 +677,11 @@ class AnomalyDetector:
             return {"status": "error", "message": f"Failed to create model: {str(e)}"}
 
     async def _get_table_data(
-        self, table: str, columns: List[str], max_rows: int,
-        time_boot_ms_range: Optional[Dict[str, int]] = None
+        self,
+        table: str,
+        columns: List[str],
+        max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> pd.DataFrame:
         """Get data from the specified table and columns.
 
@@ -684,21 +704,24 @@ class AnomalyDetector:
             return pd.DataFrame()
 
     async def _get_table_data_with_sampling(
-        self, table: str, columns: List[str], max_rows: int,
-        time_boot_ms_range: Optional[Dict[str, int]] = None
+        self,
+        table: str,
+        columns: List[str],
+        max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> Tuple[pd.DataFrame, bool]:
         """Get data from a table with sampling for large tables.
 
-Args:
-    table (str): Table name
-    columns (List[str]): Columns to fetch
-    max_rows (int): Maximum number of rows to fetch
-    time_boot_ms_range (Dict[str, int], optional): Time range to filter results 
-                                                  with format {'start': start_ms, 'end': end_ms}
+        Args:
+            table (str): Table name
+            columns (List[str]): Columns to fetch
+            max_rows (int): Maximum number of rows to fetch
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results
+                                                          with format {'start': start_ms, 'end': end_ms}
 
-Returns:
-    Tuple[pd.DataFrame, bool]: Table data and whether sampling was applied
-"""
+        Returns:
+            Tuple[pd.DataFrame, bool]: Table data and whether sampling was applied
+        """
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 # Get row count
@@ -873,8 +896,12 @@ Returns:
             }
 
             # Add time_boot_ms to the result if it exists in the dataframe
-            if 'time_boot_ms' in df.columns:
-                result["time_boot_ms"] = int(df.iloc[i]['time_boot_ms']) if not pd.isna(df.iloc[i]['time_boot_ms']) else None
+            if "time_boot_ms" in df.columns:
+                result["time_boot_ms"] = (
+                    int(df.iloc[i]["time_boot_ms"])
+                    if not pd.isna(df.iloc[i]["time_boot_ms"])
+                    else None
+                )
 
             results.append(result)
             if is_anomaly:

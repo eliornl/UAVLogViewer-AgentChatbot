@@ -33,7 +33,7 @@ class AgentScratchpad:
     context for the agent across multiple turns. It formats this history in a way
     that can be included in the agent's prompt, helping it understand what actions
     have already been taken and their outcomes.
-    
+
     PERFORMANCE OPTIMIZATION: Implements aggressive retention policy - keeps only the
     last step to prevent memory buildup and reduce token usage across conversations.
     """
@@ -49,7 +49,9 @@ class AgentScratchpad:
         self.intermediate_steps: List[Tuple[Dict[str, Any], str]] = []
         self.agent_actions: List[Dict[str, Any]] = []
         self.logger = logger.bind(session_id=session_id)
-        self.logger.info("Initialized agent scratchpad with aggressive retention policy")
+        self.logger.info(
+            "Initialized agent scratchpad with aggressive retention policy"
+        )
 
     def process_agent_action(
         self, next_action: Union[AgentAction, AgentFinish]
@@ -206,11 +208,13 @@ class AgentScratchpad:
                 if "anomalies_found" in observation and "summary" in observation:
                     # Check if we have the enhanced time summary from telemetry_agent
                     if "time_summary" in observation:
-                        return observation.get("summary", "Anomaly detection completed.")
-                    
+                        return observation.get(
+                            "summary", "Anomaly detection completed."
+                        )
+
                     # Fall back to extracting time info ourselves if needed
                     time_boot_info = ""
-                    
+
                     # Check if time range filter was applied
                     if "time_boot_ms_range" in observation:
                         time_range = observation["time_boot_ms_range"]
@@ -219,41 +223,64 @@ class AgentScratchpad:
                         time_boot_info += f" [CONTEXT BOUNDARY MARKER - QUERY-SPECIFIC TIME FILTER] CRITICAL: Results filtered to time range: {start}-{end}ms. Only consider anomalies within this range for THIS QUERY ONLY. This filter MUST BE DISCARDED for any new user question."
                     else:
                         time_boot_info += " [CONTEXT: FULL DATASET - This result includes ALL anomalies across the ENTIRE flight with NO time filtering]"
-                    
-                    if observation.get("includes_time_boot_ms") and "tables_summary" in observation:
+
+                    if (
+                        observation.get("includes_time_boot_ms")
+                        and "tables_summary" in observation
+                    ):
                         # Check for time insights first
-                        if "time_insights" in observation and observation["time_insights"]:
+                        if (
+                            "time_insights" in observation
+                            and observation["time_insights"]
+                        ):
                             insights = observation["time_insights"]
-                            
+
                             # Add flight phase information if available
-                            if "most_problematic_phase" in insights and "flight_phases" in insights:
+                            if (
+                                "most_problematic_phase" in insights
+                                and "flight_phases" in insights
+                            ):
                                 phase = insights["most_problematic_phase"]
                                 phase_data = insights["flight_phases"][phase]
                                 time_boot_info += f" Most anomalies during {phase} phase ({phase_data['start_time']}-{phase_data['end_time']}ms)."
-                            
+
                             # Add correlated anomalies info if available
-                            elif "correlated_anomalies" in insights and insights["correlated_anomalies"]:
+                            elif (
+                                "correlated_anomalies" in insights
+                                and insights["correlated_anomalies"]
+                            ):
                                 correlated = insights["correlated_anomalies"][0]
                                 time_boot_info += f" Found related anomalies between {' and '.join(correlated['tables'])} at {correlated['time_range'][0]}ms."
-                        
+
                         # Fall back to simple time ranges if no insights
                         if not time_boot_info or "time range" in time_boot_info:
                             time_ranges = []
                             for table in observation.get("tables_summary", []):
                                 if "time_range" in table:
-                                    time_ranges.append(f"{table['table']}: {table['time_range']['min']}-{table['time_range']['max']}ms")
+                                    time_ranges.append(
+                                        f"{table['table']}: {table['time_range']['min']}-{table['time_range']['max']}ms"
+                                    )
                                 elif "anomaly_details" in table:
-                                    times = [detail.get("time_boot_ms") for detail in table.get("anomaly_details", []) 
-                                            if detail.get("time_boot_ms") is not None]
+                                    times = [
+                                        detail.get("time_boot_ms")
+                                        for detail in table.get("anomaly_details", [])
+                                        if detail.get("time_boot_ms") is not None
+                                    ]
                                     if times:
-                                        time_ranges.append(f"{table['table']}: {min(times)}-{max(times)}ms")
-                            
+                                        time_ranges.append(
+                                            f"{table['table']}: {min(times)}-{max(times)}ms"
+                                        )
+
                             if time_ranges:
-                                phase_info = f" Time ranges: {'; '.join(time_ranges[:3])}"
+                                phase_info = (
+                                    f" Time ranges: {'; '.join(time_ranges[:3])}"
+                                )
                                 if len(time_ranges) > 3:
-                                    phase_info += f" and {len(time_ranges) - 3} more tables"
+                                    phase_info += (
+                                        f" and {len(time_ranges) - 3} more tables"
+                                    )
                                 time_boot_info += phase_info
-                    
+
                     # Return the summary with time_boot_ms info if available
                     summary = observation.get("summary", "Anomaly detection completed.")
                     return f"{summary}{time_boot_info}"
@@ -310,21 +337,26 @@ class AgentScratchpad:
                 summary_match = re.search(
                     r'summary[\'|"]?:\s*[\'|"]([^\'|"]+)[\'|"]?', obs_str
                 )
-                
+
                 # Try to extract time-related information if available
                 time_boot_info = ""
-                
+
                 # Check for time range filter
-                time_range_match = re.search(r'time_boot_ms_range[\'|"]?:\s*{[\'|"]?start[\'|"]?:\s*(\d+),\s*[\'|"]?end[\'|"]?:\s*(\d+)}', obs_str)
+                time_range_match = re.search(
+                    r'time_boot_ms_range[\'|"]?:\s*{[\'|"]?start[\'|"]?:\s*(\d+),\s*[\'|"]?end[\'|"]?:\s*(\d+)}',
+                    obs_str,
+                )
                 if time_range_match:
                     start = time_range_match.group(1)
                     end = time_range_match.group(2)
                     time_boot_info = f" [STRICT CONTEXT BOUNDARY - TIME FILTER: {start}-{end}ms] (CRITICAL: Only anomalies between {start}-{end}ms are relevant for THIS QUERY ONLY. ANY NEW QUESTION MUST DISCARD THIS FILTER COMPLETELY)"
                 else:
                     time_boot_info = " [FULL DATASET CONTEXT: Complete flight data with NO time filtering - ALL anomalies included]"
-                
+
                 # Look for time summary first
-                time_summary_match = re.search(r'time_summary[\'|"]?:\s*[\'|"]([^\'|"]+)[\'|"]', obs_str)
+                time_summary_match = re.search(
+                    r'time_summary[\'|"]?:\s*[\'|"]([^\'|"]+)[\'|"]', obs_str
+                )
                 if time_summary_match:
                     time_boot_info += f" {time_summary_match.group(1)}"
                 else:
@@ -332,13 +364,22 @@ class AgentScratchpad:
                     time_ms_match = re.search(r'time_boot_ms[\'|"]?:\s*(\d+)', obs_str)
                     if time_ms_match and not time_boot_info:
                         time_boot_info = f" (time_boot_ms: {time_ms_match.group(1)})"
-                    
+
                     # Check for phase information
-                    phase_match = re.search(r'most_problematic_phase[\'|"]?:\s*[\'|"]([^\'|"]+)[\'|"]', obs_str)
+                    phase_match = re.search(
+                        r'most_problematic_phase[\'|"]?:\s*[\'|"]([^\'|"]+)[\'|"]',
+                        obs_str,
+                    )
                     if phase_match:
-                        phase_info = f" (Most anomalies during {phase_match.group(1)} phase)"
-                        time_boot_info = time_boot_info + phase_info if time_boot_info else phase_info
-                
+                        phase_info = (
+                            f" (Most anomalies during {phase_match.group(1)} phase)"
+                        )
+                        time_boot_info = (
+                            time_boot_info + phase_info
+                            if time_boot_info
+                            else phase_info
+                        )
+
                 if summary_match:
                     return f"{summary_match.group(1)}{time_boot_info}"
 
@@ -525,7 +566,7 @@ class AgentScratchpad:
 
         This method adds actions and observations to the scratchpad, ensuring
         that context boundaries are clearly marked to prevent context contamination
-        between different queries. Implements aggressive retention - keeps only the 
+        between different queries. Implements aggressive retention - keeps only the
         last step to optimize performance.
 
         Args:
@@ -543,7 +584,9 @@ class AgentScratchpad:
             # Add timestamp to make the context boundary clearer
             compact_observation += f"\n[Context Timestamp: {time.time()}] THIS TIME FILTER IS VALID ONLY FOR THE CURRENT QUESTION"
         else:
-            compact_observation = f"[FULL DATASET CONTEXT - COMPLETE FLIGHT DATA] {compact_observation}"
+            compact_observation = (
+                f"[FULL DATASET CONTEXT - COMPLETE FLIGHT DATA] {compact_observation}"
+            )
 
         # Add the action and observation to the intermediate steps
         self.intermediate_steps.append((action_details, compact_observation))
@@ -555,7 +598,7 @@ class AgentScratchpad:
             self.logger.debug(
                 "Truncated scratchpad for performance optimization",
                 retained_steps=len(self.intermediate_steps),
-                max_steps=MAX_SCRATCHPAD_STEPS
+                max_steps=MAX_SCRATCHPAD_STEPS,
             )
 
         # Log the addition
@@ -565,7 +608,7 @@ class AgentScratchpad:
             observation_snippet=(
                 compact_observation[:100] if compact_observation else "None"
             ),
-            total_steps=len(self.intermediate_steps)
+            total_steps=len(self.intermediate_steps),
         )
 
     def get_scratchpad_content(self) -> List[Tuple[Dict[str, Any], str]]:
@@ -661,7 +704,7 @@ class AgentScratchpad:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about the scratchpad.
-        
+
         Returns:
             Dict[str, Any]: Statistics including step count, total size, etc.
         """
@@ -671,7 +714,7 @@ class AgentScratchpad:
             "total_characters": len(total_text),
             "session_id": self.session_id,
             "retention_policy": SCRATCHPAD_RETENTION_POLICY,
-            "max_steps_configured": MAX_SCRATCHPAD_STEPS
+            "max_steps_configured": MAX_SCRATCHPAD_STEPS,
         }
 
     def clear(self) -> None:
@@ -679,10 +722,7 @@ class AgentScratchpad:
         steps_cleared = len(self.intermediate_steps)
         self.intermediate_steps.clear()
         self.agent_actions.clear()
-        self.logger.info(
-            "Cleared scratchpad",
-            steps_cleared=steps_cleared
-        )
+        self.logger.info("Cleared scratchpad", steps_cleared=steps_cleared)
 
     def get_step_count(self) -> int:
         """Get the current number of steps in the scratchpad."""

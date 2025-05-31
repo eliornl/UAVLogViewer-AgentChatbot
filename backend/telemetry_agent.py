@@ -58,7 +58,9 @@ CHAT_TIMEOUT_SECONDS: float = 60.0  # Timeout for agent processing, including ML
 # Output formatting constants
 MAX_TOOL_OUTPUT_ROWS: int = 50  # Max rows for query_duckdb and detect_anomalies output
 EARLY_TRUNCATION: bool = True  # Re-enabled after fixing sync wrapper issues
-SLIDING_WINDOW_EXCHANGES: int = 4  # Match window size from conversation_memory_manager.py
+SLIDING_WINDOW_EXCHANGES: int = (
+    4  # Match window size from conversation_memory_manager.py
+)
 
 # Error message constants
 ERROR_EMPTY_MESSAGE: str = "Empty message provided, skipping processing"
@@ -423,7 +425,7 @@ db_connection_cache = {}
 # Cache for query results to avoid repeating identical queries with TTL and LRU
 query_result_cache = {}
 query_cache_access_order = []  # Track access order for LRU eviction
-query_cache_timestamps = {}   # Track cache entry timestamps for TTL
+query_cache_timestamps = {}  # Track cache entry timestamps for TTL
 
 # Maximum size for the query cache to prevent memory issues
 MAX_QUERY_CACHE_SIZE = 20  # Increased from 2 for better performance
@@ -431,6 +433,7 @@ QUERY_CACHE_TTL_SECONDS = 300  # 5 minutes TTL for query results
 
 # Database connection pool configuration
 MAX_DB_CONNECTIONS = 10  # Maximum number of cached database connections
+
 
 async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     """Execute a SQL query on a DuckDB database with optimized performance.
@@ -456,19 +459,29 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             args_dict = json.loads(tool_input)
         except json.JSONDecodeError as e:
             # Try to extract JSON if surrounded by other text
-            json_match = re.search(r'(\{.*\})', tool_input, re.DOTALL)
+            json_match = re.search(r"(\{.*\})", tool_input, re.DOTALL)
             if json_match:
                 try:
                     args_dict = json.loads(json_match.group(1))
-                    logger.debug("Extracted JSON from text", extracted=json_match.group(1))
+                    logger.debug(
+                        "Extracted JSON from text", extracted=json_match.group(1)
+                    )
                 except json.JSONDecodeError:
                     logger.error("Failed to decode extracted JSON", error_str=str(e))
-                    return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
+                    return {
+                        "status": "error",
+                        "message": f"Invalid JSON input: {str(e)}",
+                    }
             else:
-                logger.error("Failed to decode tool_input string as JSON", error_str=str(e))
+                logger.error(
+                    "Failed to decode tool_input string as JSON", error_str=str(e)
+                )
                 return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
     else:
-        return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
+        return {
+            "status": "error",
+            "message": "Tool input must be a JSON string or a dictionary.",
+        }
 
     # Fast validation without full Pydantic model when possible
     if not isinstance(args_dict, dict):
@@ -485,7 +498,10 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             db_path = parsed_args.db_path
             query = parsed_args.query
         except Exception as pydantic_exc:
-            return {"status": "error", "message": f"Input validation failed: {str(pydantic_exc)}"}
+            return {
+                "status": "error",
+                "message": f"Input validation failed: {str(pydantic_exc)}",
+            }
 
     # Security checks
     if ".." in os.path.relpath(db_path):
@@ -496,14 +512,20 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     dangerous_pattern = r"\b(drop|delete|update|insert|alter|create|truncate)\b"
     if re.search(dangerous_pattern, query_lower):
         keyword = re.search(dangerous_pattern, query_lower).group(1)
-        return {"status": "error", "message": f"Query contains prohibited keyword: {keyword}"}
+        return {
+            "status": "error",
+            "message": f"Query contains prohibited keyword: {keyword}",
+        }
 
     # Check cache for this exact query with TTL validation
     cache_key = f"{db_path}:{query}"
     if cache_key in query_result_cache:
         # Check if cache entry is still valid (TTL)
-        if (cache_key in query_cache_timestamps and 
-            time.time() - query_cache_timestamps[cache_key] < QUERY_CACHE_TTL_SECONDS):
+        if (
+            cache_key in query_cache_timestamps
+            and time.time() - query_cache_timestamps[cache_key]
+            < QUERY_CACHE_TTL_SECONDS
+        ):
             # Update LRU order
             if cache_key in query_cache_access_order:
                 query_cache_access_order.remove(cache_key)
@@ -528,26 +550,34 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                 oldest_key = next(iter(db_connection_cache))
                 db_connection_cache[oldest_key].close()
                 del db_connection_cache[oldest_key]
-                logger.debug("Evicted database connection from cache", db_path=oldest_key)
+                logger.debug(
+                    "Evicted database connection from cache", db_path=oldest_key
+                )
 
             conn = duckdb.connect(db_path, read_only=True)
             db_connection_cache[db_path] = conn
-            logger.debug("Created new database connection", db_path=db_path, pool_size=len(db_connection_cache))
+            logger.debug(
+                "Created new database connection",
+                db_path=db_path,
+                pool_size=len(db_connection_cache),
+            )
 
         # Check if query is trying to access a table that might not exist
-        if 'FROM ' in query.upper() and not query.upper().startswith('SELECT EXISTS'):
+        if "FROM " in query.upper() and not query.upper().startswith("SELECT EXISTS"):
             # Extract table name from query
-            table_match = re.search(r'FROM\s+([\w_]+)', query, re.IGNORECASE)
+            table_match = re.search(r"FROM\s+([\w_]+)", query, re.IGNORECASE)
             if table_match:
                 table_name = table_match.group(1)
                 # Check if table exists
                 table_exists = await asyncio.to_thread(
-                    lambda: conn.execute(f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')").fetchone()[0]
+                    lambda: conn.execute(
+                        f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')"
+                    ).fetchone()[0]
                 )
                 if not table_exists:
                     return {
                         "status": "error",
-                        "message": f"Table '{table_name}' does not exist in this log file. The data you're looking for may not be available."
+                        "message": f"Table '{table_name}' does not exist in this log file. The data you're looking for may not be available.",
                     }
 
         # Execute query with optimized result handling and early truncation
@@ -555,42 +585,44 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             # Add LIMIT clause for early truncation if not already present
             if "limit" not in query.lower():
                 query = f"{query} LIMIT {MAX_TOOL_OUTPUT_ROWS + 1}"  # +1 to detect if there were more rows
-            
+
         result = await asyncio.to_thread(lambda: conn.execute(query).fetchall())
         columns = [desc[0] for desc in conn.description] if conn.description else []
 
         # Use list comprehension for better performance
         data_to_return = [dict(zip(columns, row)) for row in result]
         full_row_count = len(data_to_return)
-        
+
         # Apply early truncation if needed
         if EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS:
             data_to_return = data_to_return[:MAX_TOOL_OUTPUT_ROWS]
             logger.debug(
                 "Applied early truncation to query results",
                 original_count=full_row_count,
-                truncated_count=MAX_TOOL_OUTPUT_ROWS
+                truncated_count=MAX_TOOL_OUTPUT_ROWS,
             )
-        
+
         row_count = full_row_count
 
         # Store in cache
         response = {
-            "status": "success", 
-            "data": data_to_return, 
+            "status": "success",
+            "data": data_to_return,
             "row_count": row_count,
-            "truncated": EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS
+            "truncated": EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS,
         }
-        
+
         # Add truncation message if needed
         if EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS:
-            response["message"] = f"Query returned {row_count} rows but only showing first {MAX_TOOL_OUTPUT_ROWS} for performance."
+            response["message"] = (
+                f"Query returned {row_count} rows but only showing first {MAX_TOOL_OUTPUT_ROWS} for performance."
+            )
 
         # Cache the response with timestamp and LRU management
         query_result_cache[cache_key] = response
         query_cache_timestamps[cache_key] = time.time()
         query_cache_access_order.append(cache_key)
-        
+
         # Enforce cache size limit with LRU eviction
         while len(query_result_cache) > MAX_QUERY_CACHE_SIZE:
             if query_cache_access_order:
@@ -599,13 +631,14 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                     del query_result_cache[oldest_key]
                 if oldest_key in query_cache_timestamps:
                     del query_cache_timestamps[oldest_key]
-        
+
         return response
 
     except duckdb.Error as e:
         return {"status": "error", "message": f"Query failed: {str(e)}"}
     except Exception as e:
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+
 
 # Function to clear caches if needed
 def clear_query_caches() -> None:
@@ -625,39 +658,44 @@ def clear_query_caches() -> None:
     query_cache_timestamps = {}
     db_connection_cache = {}
 
+
 def get_cache_stats() -> Dict[str, Any]:
     """Get statistics about all caches for monitoring.
-    
+
     Returns:
         Dict[str, Any]: Cache statistics including sizes, hit rates, etc.
     """
     import time
+
     current_time = time.time()
-    
+
     # Count valid query cache entries
     valid_query_entries = sum(
-        1 for key, timestamp in query_cache_timestamps.items()
+        1
+        for key, timestamp in query_cache_timestamps.items()
         if current_time - timestamp < QUERY_CACHE_TTL_SECONDS
     )
-    
+
     return {
         "query_cache": {
             "total_entries": len(query_result_cache),
             "valid_entries": valid_query_entries,
             "expired_entries": len(query_result_cache) - valid_query_entries,
             "max_size": MAX_QUERY_CACHE_SIZE,
-            "ttl_seconds": QUERY_CACHE_TTL_SECONDS
+            "ttl_seconds": QUERY_CACHE_TTL_SECONDS,
         },
         "db_connections": {
             "active_connections": len(db_connection_cache),
-            "max_connections": MAX_DB_CONNECTIONS
-        }
+            "max_connections": MAX_DB_CONNECTIONS,
+        },
     }
+
 
 class DetectAnomaliesMLInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
     table: str = Field(description="Name of the telemetry table")
     columns: List[str] = Field(description="Numerical columns to analyze")
+
 
 class DetectAnomaliesBatchInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
@@ -730,7 +768,7 @@ def summarize_anomaly_results(
     tables_processed: int,
     anomalies_found: int,
     total_rows: int,
-    time_boot_ms_range: Optional[Dict[str, int]] = None
+    time_boot_ms_range: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """Summarize anomaly detection results into a more compact format with time-based insights.
 
@@ -768,7 +806,7 @@ def summarize_anomaly_results(
         "tables_summary": [],
         "includes_time_boot_ms": True,
         "time_insights": {},
-        "context_type": "full_dataset" if not time_boot_ms_range else "time_filtered"
+        "context_type": "full_dataset" if not time_boot_ms_range else "time_filtered",
     }
 
     # Add time_boot_ms_range if provided - with context boundary markers
@@ -776,7 +814,9 @@ def summarize_anomaly_results(
         simplified_result["time_boot_ms_range"] = time_boot_ms_range
         simplified_result["time_filtered"] = True
         simplified_result["context_boundary"] = "QUERY_SPECIFIC_FILTER_ONLY"
-        simplified_result["filter_warning"] = "THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION AND MUST BE DISCARDED FOR NEW QUESTIONS"
+        simplified_result["filter_warning"] = (
+            "THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION AND MUST BE DISCARDED FOR NEW QUESTIONS"
+        )
 
     # Track global time range and clusters for all anomalies
     all_anomaly_times = []
@@ -787,10 +827,7 @@ def summarize_anomaly_results(
         table_anomalies = table_result.get("anomaly_count", 0)
         # Only include tables with anomalies to further reduce size
         if table_anomalies > 0:
-            table_summary = {
-                "table": table_name,
-                "anomalies": table_anomalies
-            }
+            table_summary = {"table": table_name, "anomalies": table_anomalies}
 
             # Track time-related data for this table
             table_anomaly_times = []
@@ -802,7 +839,7 @@ def summarize_anomaly_results(
                     if row.get("is_anomaly", False):
                         anomaly_detail = {
                             "row_index": row.get("row_index"),
-                            "anomaly_score": row.get("anomaly_score")
+                            "anomaly_score": row.get("anomaly_score"),
                         }
                         # Include time_boot_ms if available
                         if "time_boot_ms" in row:
@@ -815,9 +852,11 @@ def summarize_anomaly_results(
                                 include_anomaly = True
                                 in_time_range = True
                                 if time_boot_ms_range:
-                                    start = time_boot_ms_range.get('start')
-                                    end = time_boot_ms_range.get('end')
-                                    if (start is not None and time_ms < start) or (end is not None and time_ms > end):
+                                    start = time_boot_ms_range.get("start")
+                                    end = time_boot_ms_range.get("end")
+                                    if (start is not None and time_ms < start) or (
+                                        end is not None and time_ms > end
+                                    ):
                                         in_time_range = False
                                         include_anomaly = False
                                     elif row.get("is_anomaly", False):
@@ -845,7 +884,7 @@ def summarize_anomaly_results(
                 table_summary["time_range"] = {
                     "min": min(table_anomaly_times),
                     "max": max(table_anomaly_times),
-                    "duration_ms": max(table_anomaly_times) - min(table_anomaly_times)
+                    "duration_ms": max(table_anomaly_times) - min(table_anomaly_times),
                 }
 
                 # Check for time clusters in this table (anomalies occurring close together)
@@ -858,42 +897,65 @@ def summarize_anomaly_results(
                     time_threshold = 5000
 
                     for i in range(1, len(sorted_times)):
-                        if sorted_times[i] - sorted_times[i-1] <= time_threshold:
+                        if sorted_times[i] - sorted_times[i - 1] <= time_threshold:
                             current_cluster.append(sorted_times[i])
                         else:
-                            if len(current_cluster) >= 2:  # Only consider clusters with 2+ anomalies
-                                clusters.append({
-                                    "start_time": min(current_cluster),
-                                    "end_time": max(current_cluster),
-                                    "count": len(current_cluster)
-                                })
+                            if (
+                                len(current_cluster) >= 2
+                            ):  # Only consider clusters with 2+ anomalies
+                                clusters.append(
+                                    {
+                                        "start_time": min(current_cluster),
+                                        "end_time": max(current_cluster),
+                                        "count": len(current_cluster),
+                                    }
+                                )
                             current_cluster = [sorted_times[i]]
 
                     # Add the last cluster if it exists
                     if len(current_cluster) >= 2:
-                        clusters.append({
-                            "start_time": min(current_cluster),
-                            "end_time": max(current_cluster),
-                            "count": len(current_cluster)
-                        })
+                        clusters.append(
+                            {
+                                "start_time": min(current_cluster),
+                                "end_time": max(current_cluster),
+                                "count": len(current_cluster),
+                            }
+                        )
 
                     if clusters:
                         table_summary["time_clusters"] = clusters
-                        time_clusters.extend([(c["start_time"], c["end_time"], table_name) for c in clusters])
+                        time_clusters.extend(
+                            [
+                                (c["start_time"], c["end_time"], table_name)
+                                for c in clusters
+                            ]
+                        )
 
             # Add filtered anomaly count to table summary if filtering was applied
             if time_boot_ms_range and anomaly_details:
                 # Check if this table has time_boot_ms values
-                has_time_data = any("time_boot_ms" in detail for detail in anomaly_details)
+                has_time_data = any(
+                    "time_boot_ms" in detail for detail in anomaly_details
+                )
 
                 if has_time_data:
-                    in_range_anomalies = sum(1 for detail in anomaly_details if detail.get("in_time_range", False))
+                    in_range_anomalies = sum(
+                        1
+                        for detail in anomaly_details
+                        if detail.get("in_time_range", False)
+                    )
                     table_summary["in_time_range_anomalies"] = in_range_anomalies
-                    table_summary["total_anomalies"] = len([d for d in anomaly_details if d.get("is_anomaly", False)])
+                    table_summary["total_anomalies"] = len(
+                        [d for d in anomaly_details if d.get("is_anomaly", False)]
+                    )
                 else:
                     # If no time_boot_ms values in this table, mark all anomalies as in range
                     # because we can't filter them by time
-                    anomaly_count = sum(1 for detail in anomaly_details if detail.get("is_anomaly", False))
+                    anomaly_count = sum(
+                        1
+                        for detail in anomaly_details
+                        if detail.get("is_anomaly", False)
+                    )
                     table_summary["in_time_range_anomalies"] = anomaly_count
                     table_summary["total_anomalies"] = anomaly_count
                     table_summary["no_time_data"] = True
@@ -913,7 +975,7 @@ def summarize_anomaly_results(
                 "global_time_range": {
                     "min": global_min,
                     "max": global_max,
-                    "duration_ms": global_max - global_min
+                    "duration_ms": global_max - global_min,
                 }
             }
 
@@ -932,37 +994,51 @@ def summarize_anomaly_results(
                 landing_start = global_max - (flight_duration * 0.15)  # Last 15%
 
                 # Count anomalies in each phase
-                takeoff_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and t <= takeoff_end)
-                cruise_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and takeoff_end < t < landing_start)
-                landing_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and t >= landing_start)
+                takeoff_anomalies = sum(
+                    1
+                    for t, _ in all_anomaly_times
+                    if t is not None and t <= takeoff_end
+                )
+                cruise_anomalies = sum(
+                    1
+                    for t, _ in all_anomaly_times
+                    if t is not None and takeoff_end < t < landing_start
+                )
+                landing_anomalies = sum(
+                    1
+                    for t, _ in all_anomaly_times
+                    if t is not None and t >= landing_start
+                )
 
                 simplified_result["time_insights"]["flight_phases"] = {
                     "takeoff": {
                         "start_time": global_min,
                         "end_time": int(takeoff_end),
-                        "anomalies": takeoff_anomalies
+                        "anomalies": takeoff_anomalies,
                     },
                     "cruise": {
                         "start_time": int(takeoff_end) + 1,
                         "end_time": int(landing_start) - 1,
-                        "anomalies": cruise_anomalies
+                        "anomalies": cruise_anomalies,
                     },
                     "landing": {
                         "start_time": int(landing_start),
                         "end_time": global_max,
-                        "anomalies": landing_anomalies
-                    }
+                        "anomalies": landing_anomalies,
+                    },
                 }
 
                 # Identify the most problematic phase
                 phase_counts = [
                     ("takeoff", takeoff_anomalies),
                     ("cruise", cruise_anomalies),
-                    ("landing", landing_anomalies)
+                    ("landing", landing_anomalies),
                 ]
                 most_problematic = max(phase_counts, key=lambda x: x[1])
                 if most_problematic[1] > 0:
-                    simplified_result["time_insights"]["most_problematic_phase"] = most_problematic[0]
+                    simplified_result["time_insights"]["most_problematic_phase"] = (
+                        most_problematic[0]
+                    )
 
             # Cross-table time correlation - identify when multiple tables have anomalies at similar times
             if len(time_clusters) >= 2:
@@ -970,22 +1046,27 @@ def summarize_anomaly_results(
                 correlated_events = []
                 for i in range(len(time_clusters)):
                     start1, end1, table1 = time_clusters[i]
-                    for j in range(i+1, len(time_clusters)):
+                    for j in range(i + 1, len(time_clusters)):
                         start2, end2, table2 = time_clusters[j]
                         # Check for overlap
                         if (start1 <= end2 and start2 <= end1) and table1 != table2:
                             overlap_start = max(start1, start2)
                             overlap_end = min(end1, end2)
-                            correlated_events.append({
-                                "tables": [table1, table2],
-                                "time_range": [overlap_start, overlap_end],
-                                "duration_ms": overlap_end - overlap_start
-                            })
+                            correlated_events.append(
+                                {
+                                    "tables": [table1, table2],
+                                    "time_range": [overlap_start, overlap_end],
+                                    "duration_ms": overlap_end - overlap_start,
+                                }
+                            )
 
                 if correlated_events:
-                    simplified_result["time_insights"]["correlated_anomalies"] = correlated_events
+                    simplified_result["time_insights"][
+                        "correlated_anomalies"
+                    ] = correlated_events
 
     return simplified_result
+
 
 def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
     """Detect anomalies across multiple tables efficiently.
@@ -1123,7 +1204,7 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
                         "Applied truncation to anomaly detection results",
                         table=table_name,
                         original_count=original_count,
-                        truncated_count=MAX_TOOL_OUTPUT_ROWS
+                        truncated_count=MAX_TOOL_OUTPUT_ROWS,
                     )
 
         logger.info(
@@ -1155,16 +1236,13 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
                 tables_processed,
                 anomalies_found,
                 total_rows,
-                parsed_args.time_boot_ms_range
+                parsed_args.time_boot_ms_range,
             )
         except Exception as e:
             logger.error(f"Error in time range filtering: {str(e)}", exc_info=True)
             # Fall back to unfiltered results if filtering fails
             simplified_result = summarize_anomaly_results(
-                result,
-                tables_processed,
-                anomalies_found,
-                total_rows
+                result, tables_processed, anomalies_found, total_rows
             )
 
         # Add a time-based summary to help the LLM understand anomaly patterns
@@ -1174,18 +1252,24 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
 
             # Add time range filter information if it was provided
             if parsed_args.time_boot_ms_range:
-                start = parsed_args.time_boot_ms_range.get('start', 'N/A')
-                end = parsed_args.time_boot_ms_range.get('end', 'N/A')
+                start = parsed_args.time_boot_ms_range.get("start", "N/A")
+                end = parsed_args.time_boot_ms_range.get("end", "N/A")
                 filtered_count = simplified_result.get("filtered_anomaly_count", 0)
 
-                time_insights_summary.append(f"[THIS QUERY ONLY] FILTERED TO TIME RANGE: {start}-{end}ms. Found {filtered_count} anomalies within this range (out of {anomalies_found} total). THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION.")
+                time_insights_summary.append(
+                    f"[THIS QUERY ONLY] FILTERED TO TIME RANGE: {start}-{end}ms. Found {filtered_count} anomalies within this range (out of {anomalies_found} total). THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION."
+                )
 
                 # Add information about tables without time data if applicable
                 if simplified_result.get("tables_without_time_data", 0) > 0:
-                    time_insights_summary.append(f"Note: {simplified_result.get('tables_without_time_data', 0)} tables didn't have time_boot_ms data and couldn't be filtered by time.")
+                    time_insights_summary.append(
+                        f"Note: {simplified_result.get('tables_without_time_data', 0)} tables didn't have time_boot_ms data and couldn't be filtered by time."
+                    )
 
                 # Add explicit context separation marker
-                simplified_result["context_boundary_marker"] = "TIME_FILTERED_RESULTS_FOR_CURRENT_QUERY_ONLY"
+                simplified_result["context_boundary_marker"] = (
+                    "TIME_FILTERED_RESULTS_FOR_CURRENT_QUERY_ONLY"
+                )
 
             # Add flight phase information if available
             if "flight_phases" in insights:
@@ -1202,7 +1286,9 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
 
             # Add information about correlated anomalies across tables
             if "correlated_anomalies" in insights and insights["correlated_anomalies"]:
-                correlated = insights["correlated_anomalies"][0]  # Take the first correlation as an example
+                correlated = insights["correlated_anomalies"][
+                    0
+                ]  # Take the first correlation as an example
                 time_insights_summary.append(
                     f"Found correlated anomalies between {' and '.join(correlated['tables'])} "
                     f"at around {correlated['time_range'][0]}ms."
@@ -1212,21 +1298,30 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
             if time_insights_summary and len(time_insights_summary) > 0:
                 simplified_result["time_summary"] = " ".join(time_insights_summary)
                 # Only add time_summary to summary if it's not already included
-                if simplified_result["time_summary"] not in simplified_result["summary"]:
-                    simplified_result["summary"] += f" {simplified_result['time_summary']}"
+                if (
+                    simplified_result["time_summary"]
+                    not in simplified_result["summary"]
+                ):
+                    simplified_result[
+                        "summary"
+                    ] += f" {simplified_result['time_summary']}"
 
         # Add the time_boot_ms_range to the output if it was provided
         if parsed_args.time_boot_ms_range:
             simplified_result["time_boot_ms_range"] = parsed_args.time_boot_ms_range
             # Add explicit context boundary markers
             simplified_result["query_specific_filter"] = True
-            simplified_result["context_boundary"] = "THIS_RESULT_IS_TIME_FILTERED_FOR_CURRENT_QUERY_ONLY"
+            simplified_result["context_boundary"] = (
+                "THIS_RESULT_IS_TIME_FILTERED_FOR_CURRENT_QUERY_ONLY"
+            )
 
             # Update the summary to emphasize the filtered results
             if simplified_result.get("filtered_anomaly_count", 0) != anomalies_found:
                 filtered_count = simplified_result.get("filtered_anomaly_count", 0)
                 # Update the summary to highlight filtered results
-                simplified_result["summary"] = f"[TIME-FILTERED RESULT - CURRENT QUERY ONLY] Anomaly detection completed on {tables_processed} tables. Found {filtered_count} anomalies within specified time range ({anomalies_found} total anomalies across {total_rows} rows)."
+                simplified_result["summary"] = (
+                    f"[TIME-FILTERED RESULT - CURRENT QUERY ONLY] Anomaly detection completed on {tables_processed} tables. Found {filtered_count} anomalies within specified time range ({anomalies_found} total anomalies across {total_rows} rows)."
+                )
                 # Replace the anomalies_found count with the filtered count
                 simplified_result["anomalies_found"] = filtered_count
 
@@ -1251,7 +1346,7 @@ def query_duckdb_sync(tool_input: Any) -> Dict[str, Any]:
     """Synchronous wrapper for async query_duckdb function."""
     import asyncio
     import threading
-    
+
     def run_async():
         """Run the async function in a new event loop."""
         new_loop = asyncio.new_event_loop()
@@ -1260,16 +1355,18 @@ def query_duckdb_sync(tool_input: Any) -> Dict[str, Any]:
             return new_loop.run_until_complete(query_duckdb(tool_input))
         finally:
             new_loop.close()
-    
+
     try:
         # Always run in a separate thread to avoid event loop conflicts
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(run_async)
             return future.result(timeout=30)  # 30 second timeout
     except Exception as e:
         logger.error(f"Error in sync wrapper: {str(e)}")
         return {"status": "error", "message": f"Query execution failed: {str(e)}"}
+
 
 # Register tools for LangChain - using sync wrapper for async functions
 query_duckdb_tool: StructuredTool = StructuredTool.from_function(
@@ -1736,14 +1833,14 @@ class TelemetryAgent:
                 await self.conversation_memory_manager.aget_memory()
             )
             chat_history_messages = memory.load_memory_variables({}).get("history", [])
-            
+
             # Log conversation memory size for monitoring
             if chat_history_messages:
                 self.logger.debug(
                     "Conversation history size",
                     current_size=len(chat_history_messages),
                     max_size=SLIDING_WINDOW_EXCHANGES,
-                    memory_strategy=memory_strategy.value
+                    memory_strategy=memory_strategy.value,
                 )
 
             # Format chat_history_messages into a string for the prompt
@@ -1910,30 +2007,32 @@ class TelemetryAgent:
             scratchpad_tokens = len(
                 self.token_encoder.encode(current_custom_scratchpad)
             )
-            
+
             # Calculate token usage percentage for early warning
-            token_percentage = (scratchpad_tokens / self.max_context_tokens)
+            token_percentage = scratchpad_tokens / self.max_context_tokens
             formatted_percentage = f"{token_percentage * 100:.1f}%"
-            
+
             # Log scratchpad token usage for monitoring
             if token_percentage > MEMORY_WARNING_THRESHOLD:
                 self.logger.debug(
                     "Scratchpad token usage high",
                     tokens=scratchpad_tokens,
                     max_context_tokens=self.max_context_tokens,
-                    token_percentage=formatted_percentage
+                    token_percentage=formatted_percentage,
                 )
-            
+
             self.logger.debug(
                 "Scratchpad token usage",
                 tokens=scratchpad_tokens,
                 max_context_tokens=self.max_context_tokens,
                 token_percentage=formatted_percentage,
-                steps_retained=len(self.scratchpad.intermediate_steps)
+                steps_retained=len(self.scratchpad.intermediate_steps),
             )
-            
+
             # Fallback safety check: if scratchpad still grows too large despite aggressive retention
-            if scratchpad_tokens > self.max_context_tokens // 10:  # More restrictive threshold
+            if (
+                scratchpad_tokens > self.max_context_tokens // 10
+            ):  # More restrictive threshold
                 self.logger.warning(
                     "Scratchpad exceeds safety threshold despite aggressive retention",
                     tokens=scratchpad_tokens,
@@ -1954,15 +2053,15 @@ class TelemetryAgent:
                 metadata_token_usage=metadata["token_usage"],
                 metadata_is_clarification=metadata["is_clarification"],
             )
-            
+
             # Simple memory monitoring without external dependencies
             if MEMORY_CHECK_ENABLED:
                 self.logger.debug(
                     "Processing completed successfully",
                     response_length=len(response),
-                    session_id=self.session_id
+                    session_id=self.session_id,
                 )
-            
+
             return response, metadata
 
         except asyncio.TimeoutError:
