@@ -273,9 +273,13 @@ class ConversationMemoryManager:
             asyncio.TimeoutError: If memory update exceeds MEMORY_UPDATE_TIMEOUT_SECONDS.
         """
         try:
+            user_content, assistant_content = message_pair
+            
+            # First, always add the message to the current memory object
+            self.memory.chat_memory.add_user_message(user_content)
+            self.memory.chat_memory.add_ai_message(assistant_content)
 
             async def update_memory() -> None:
-                user_content, assistant_content = message_pair
                 msg_tokens: int = self.llm_token_encoder.count_tokens([message_pair])
                 self.history.append(message_pair)
                 # Keep only the last exchanges for sliding window memory

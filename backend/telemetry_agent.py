@@ -110,20 +110,21 @@ Tables available (including column names in parentheses): {tables}
 
 **Critical Instructions & Workflow:**
 
-1. **PRIORITY ONE: Check Your Memory & Scratchpad First!**
-    * Before doing ANYTHING else, review your **Chat History** (provided below) and your **Scratchpad** (previous analysis context: {agent_scratchpad_content}).
-    * Chat History:
+1. **MANDATORY FIRST STEP: Check Your Memory & Scratchpad - DO NOT SKIP THIS!**
+    * **BEFORE USING ANY TOOLS**, carefully examine your **Scratchpad** and **Chat History** for existing answers:
+    * **Scratchpad Context** (previous analysis results): {agent_scratchpad_content}
+    * **Chat History**:
         {chat_history}
-    * Is the answer to the current question "{input}" already available from your previous work (in Scratchpad) or the Chat History?
-        * **YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
-        * **YES:** Respond with the answer from your previous work, but be sure to highlight it as such. You can also expand on previous work for clarity.
-        * **NO:** Continue with step 2.
+    * **DECISION POINT**: Does the Scratchpad or Chat History already contain the complete answer to "{input}"?
+        * **YES - ANSWER FOUND**: Immediately provide the Final Answer using the existing information. State clearly that you're using previous analysis results. DO NOT use any tools. Example: "Based on my previous analysis in the scratchpad, the highest altitude reached was 644.45 meters."
+        * **PARTIAL ANSWER FOUND**: If you have related but incomplete information, use it as context but proceed with minimal additional analysis only if absolutely necessary.
+        * **NO - NEW ANALYSIS NEEDED**: Only then proceed with the tool-based analysis below.
     * **CRITICAL CONTEXT BOUNDARY RULE:** Each new user question starts a completely fresh analysis context with NO memory of previous filters. You MUST:
         1. NEVER assume that constraints or filters from previous questions apply to the current question
         2. NEVER carry forward time ranges from previous queries
         3. ALWAYS interpret each question as referring to the ENTIRE dataset unless explicitly specified otherwise
         4. IMMEDIATELY DISCARD all previous time range filters when processing a new user question
-    * **IF NO (or if the information is insufficient):** Proceed with a fresh analysis using the steps below.
+    * **IF NO EXISTING ANSWER FOUND:** Only then proceed with fresh analysis using the steps below.
 
 Now, if you determined the answer was NOT in your memory, proceed with the following:
 
