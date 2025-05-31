@@ -436,11 +436,23 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     if isinstance(tool_input, dict):
         args_dict = tool_input
     elif isinstance(tool_input, str):
+        # Handle potential nested JSON issues
+        tool_input = tool_input.strip()
         try:
             args_dict = json.loads(tool_input)
         except json.JSONDecodeError as e:
-            logger.error("Failed to decode tool_input string as JSON", error_str=str(e))
-            return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
+            # Try to extract JSON if surrounded by other text
+            json_match = re.search(r'(\{.*\})', tool_input, re.DOTALL)
+            if json_match:
+                try:
+                    args_dict = json.loads(json_match.group(1))
+                    logger.debug("Extracted JSON from text", extracted=json_match.group(1))
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode extracted JSON", error_str=str(e))
+                    return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
+            else:
+                logger.error("Failed to decode tool_input string as JSON", error_str=str(e))
+                return {"status": "error", "message": f"Invalid JSON input: {str(e)}"}
     else:
         return {"status": "error", "message": "Tool input must be a JSON string or a dictionary."}
 
@@ -1332,7 +1344,7 @@ class TelemetryAgent:
         # Set up ReAct agent with tools
         tools: List[Tool] = [query_duckdb_tool, detect_anomalies_tool]
 
-        # Create ReAct agent
+        # Create ReAct agent with enhanced parsing capabilities
         agent = create_react_agent(llm=self.llm, tools=tools, prompt=self.prompt)
 
         # Create agent executor without memory (we'll handle memory manually)
@@ -1340,8 +1352,8 @@ class TelemetryAgent:
             agent=agent,
             tools=tools,
             verbose=True,
-            handle_parsing_errors='Check your tool input format. It should be valid JSON with proper key-value pairs. For example: {"db_path": "/path/to/file.duckdb", "query": "SELECT * FROM table"}',
-            max_iterations=20,  # Prevent infinite loops (Increased from 10)
+            handle_parsing_errors=True,  # Use built-in error handling instead of custom message
+            max_iterations=15,  # Prevent infinite loops
             max_execution_time=200,  # Increased from 120s, less than CHAT_TIMEOUT_SECONDS (240s)
             return_intermediate_steps=True,  # Ensure agent's thought process is returned
         )
@@ -1665,9 +1677,11 @@ class TelemetryAgent:
                 for agent_action_obj, observation_str in intermediate_steps_raw:
                     # agent_action_obj is of type langchain_core.agents.AgentAction
                     # observation_str is the string output of the tool
+                    tool_input = agent_action_obj.tool_input
+                    
                     action_details_for_scratchpad = {
                         "tool": agent_action_obj.tool,
-                        "tool_input": agent_action_obj.tool_input,
+                        "tool_input": tool_input,
                         # The 'log' in AgentAction contains the thought process leading to this action.
                         "thought_process_for_this_action": agent_action_obj.log.strip(),
                     }

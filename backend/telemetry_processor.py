@@ -31,6 +31,7 @@ class TelemetryProcessor:
     3. Converting messages to pandas DataFrames with appropriate data types
     4. Storing data in session-specific DuckDB tables for efficient querying
     5. Handling errors, timeouts, and retries for robust processing
+    6. Creating indexes on time_boot_ms columns when requested (separate operation)
 
     The process is fully asynchronous and designed to handle large log files with
     configurable timeouts. Each message type is stored in a separate table with
@@ -74,6 +75,8 @@ class TelemetryProcessor:
     FILE_DB_ERROR: str = "File or database operation failed: {}"
     PARSING_ERROR: str = "Telemetry parsing failed: {}"
     UNEXPECTED_ERROR: str = "Unexpected telemetry processing error: {}"
+    INDEX_CREATION_ERROR: str = "Failed to create time_boot_ms index in {}: {}"
+    INDEX_TIMEOUT_ERROR: str = "Index creation timed out after {} seconds"
 
     @staticmethod
     def map_dtype(dtype: pd.api.extensions.ExtensionDtype | np.dtype | type) -> str:
@@ -135,6 +138,7 @@ class TelemetryProcessor:
             OSError: If file read operations fail.
             duckdb.IOException: If DuckDB database operations fail.
             asyncio.TimeoutError: If parsing or saving exceeds timeouts.
+
         """
         session_logger = logger.bind(
             session_id=session.session_id, file_name=session.file_name
@@ -294,6 +298,9 @@ class TelemetryProcessor:
                             row_count=len(df),
                         )
                         conn.commit()
+                        
+                        # Note: Indexes for time_boot_ms are created separately via
+                        # create_time_boot_ms_indexes() to avoid timeouts during initial data load
 
             try:
                 await asyncio.wait_for(
@@ -347,3 +354,110 @@ class TelemetryProcessor:
                 exc_info=True,
             )
             raise ValueError(TelemetryProcessor.UNEXPECTED_ERROR.format(str(e))) from e
+            
+    @staticmethod
+    async def create_time_boot_ms_indexes(session: Session, storage_dir: str, db_prefix: str) -> None:
+        """Create indexes on time_boot_ms columns for all tables that contain this field.
+        
+        This method should be called separately from parse_and_save to avoid timeouts during
+        initial data loading. It creates an index on the time_boot_ms column for each table
+        that contains this field, improving query performance for time-based filtering.
+        
+        The method is designed to be non-blocking and fault-tolerant:
+        - It will not raise exceptions if index creation fails
+        - It logs errors but allows the application to continue
+        - It uses a single database transaction for efficiency
+        - It has a timeout to prevent hanging
+        
+        Args:
+            session: Session object containing session_id and other metadata.
+            storage_dir: Directory where DuckDB files are stored.
+            db_prefix: Prefix for DuckDB database filenames.
+        """
+        session_logger = logger.bind(
+            session_id=session.session_id, file_name=session.file_name
+        )
+        try:
+            # Prepare DuckDB database path
+            db_path = os.path.join(storage_dir, f"{db_prefix}{session.session_id}.duckdb")
+            if ".." in os.path.relpath(db_path, storage_dir):
+                session_logger.error("Invalid database path", db_path=db_path)
+                raise ValueError(TelemetryProcessor.INVALID_DB_PATH_ERROR.format(db_path))
+                
+            # Define function to create indexes
+            def create_indexes() -> None:
+                with duckdb.connect(db_path) as conn:
+                    # Get list of all tables with time_boot_ms column in a single query
+                    table_columns = conn.execute("""
+                        SELECT t.table_name, c.column_name 
+                        FROM duckdb_tables() t 
+                        JOIN duckdb_columns() c ON t.table_name = c.table_name 
+                        WHERE t.table_name LIKE 'telemetry_%' 
+                        AND c.column_name = 'time_boot_ms'
+                    """).fetchall()
+                    
+                    # Create a single transaction for all indexes
+                    conn.execute("BEGIN TRANSACTION")
+                    
+                    created_count = 0
+                    for table_name, _ in table_columns:
+                        try:
+                            # Create index if it doesn't exist
+                            index_name = f"{table_name}_time_boot_ms_idx"
+                            conn.execute(
+                                f"CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\"(time_boot_ms)"
+                            )
+                            created_count += 1
+                            session_logger.debug(
+                                "Created index on time_boot_ms column",
+                                table_name=table_name,
+                                index_name=index_name
+                            )
+                        except Exception as e:
+                            session_logger.warning(
+                                "Failed to create index",
+                                table_name=table_name,
+                                error=str(e)
+                            )
+                            # Continue with other tables even if this one fails
+                    
+                    # Commit all index creations at once
+                    conn.execute("COMMIT")
+                    
+                    session_logger.info(
+                        "Created time_boot_ms indexes",
+                        created_count=created_count,
+                        total_tables=len(table_columns)
+                    )
+            
+            # Execute index creation with timeout
+            await asyncio.wait_for(
+                asyncio.to_thread(create_indexes),
+                timeout=120.0  # 2 minutes timeout for index creation
+            )
+            
+        except asyncio.TimeoutError as e:
+            session_logger.error(
+                "Index creation timed out",
+                error=str(e),
+                timeout_seconds=120.0
+            )
+            # Don't raise the exception, just log it
+            # This allows the application to continue even if index creation fails
+            return
+        except (OSError, duckdb.IOException) as e:
+            session_logger.error(
+                "Database error during index creation",
+                error=str(e)
+            )
+            # Don't raise the exception, just log it
+            return
+        except Exception as e:
+            session_logger.error(
+                "Unexpected error during index creation",
+                error_type=type(e).__name__,
+                error=str(e),
+                exc_info=True
+            )
+            # Don't raise the exception, just log it
+            return

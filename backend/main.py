@@ -10,7 +10,7 @@ from json import JSONEncoder
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Dict, List, Set, Optional, AsyncGenerator, Tuple, Any
-from fastapi import FastAPI, UploadFile, File, HTTPException, status, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, status, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -387,11 +387,12 @@ async def create_session(
 
 
 @app.post("/upload", response_model=UploadResponse, status_code=status.HTTP_201_CREATED)
-async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
+async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = BackgroundTasks()) -> UploadResponse:
     """Upload a flight log file, parse it, and create a new session.
 
     Args:
         file: Flight log file (.bin or .tlog) to upload.
+        background_tasks: FastAPI background tasks for asynchronous processing.
 
     Returns:
         UploadResponse: Response with session ID, file details, and processing status.
@@ -466,6 +467,19 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
                 await TelemetryProcessor.parse_and_save(
                     tmp_file_path, session, STORAGE_DIR, DUCKDB_FILE_PREFIX
                 )
+                
+                # Add index creation as a background task
+                background_tasks.add_task(
+                    TelemetryProcessor.create_time_boot_ms_indexes,
+                    session,
+                    STORAGE_DIR,
+                    DUCKDB_FILE_PREFIX
+                )
+                session_logger.info(
+                    "Added time_boot_ms index creation to background tasks",
+                    session_id=session_id
+                )
+                
                 session_logger.info(
                     "Session processing completed",
                     session_status=session.status,
