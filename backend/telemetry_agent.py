@@ -88,6 +88,19 @@ REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized
 
 Tables available (including column names in parentheses): {tables}
 
+**TIME-BASED ANOMALY FILTERING RULES:**
+1. When analyzing specific flight phases, ALWAYS manually verify time_boot_ms values for each anomaly
+2. Only count anomalies whose time_boot_ms values fall within your calculated phase boundaries
+3. Ignore anomalies with time_boot_ms values outside your specified range, even if returned by tools
+4. When reporting results, explicitly state which time range you're analyzing and how many anomalies fall within it
+5. CRITICAL: Time filters ONLY apply to the CURRENT query - do not carry them forward to new user questions
+6. CONTEXT SEPARATION: Each new question is an INDEPENDENT request - previous time ranges are INVALID for new questions
+
+**CONTEXT RESET REQUIREMENT:**
+- Every new user question RESETS all constraints from previous questions
+- Always treat each question as if it's the first question about the data
+- If a new question does NOT specify a time range, you MUST analyze the ENTIRE dataset
+
 **Critical Instructions & Workflow:**
 
 1. **PRIORITY ONE: Check Your Memory & Scratchpad First!**
@@ -95,8 +108,15 @@ Tables available (including column names in parentheses): {tables}
     * Chat History:
         {chat_history}
     * Is the answer to the current question "{input}" already available from your previous work (in Scratchpad) or the Chat History?
-    * **IF YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
-    * **IF NO (or if the information is insufficient):** Proceed to the analysis steps below using the specified format.
+        * **YES:** Use that information directly to formulate your Final Answer. Do NOT proceed to use tools or the ReAct loop below.
+        * **YES:** Respond with the answer from your previous work, but be sure to highlight it as such. You can also expand on previous work for clarity.
+        * **NO:** Continue with step 2.
+    * **CRITICAL CONTEXT BOUNDARY RULE:** Each new user question starts a completely fresh analysis context with NO memory of previous filters. You MUST:
+        1. NEVER assume that constraints or filters from previous questions apply to the current question
+        2. NEVER carry forward time ranges from previous queries
+        3. ALWAYS interpret each question as referring to the ENTIRE dataset unless explicitly specified otherwise
+        4. IMMEDIATELY DISCARD all previous time range filters when processing a new user question
+    * **IF NO (or if the information is insufficient):** Proceed with a fresh analysis using the steps below.
 
 Now, if you determined the answer was NOT in your memory, proceed with the following:
 
@@ -145,11 +165,15 @@ Final Answer: the final answer to the original input question, grounded in the d
             * Calculate phase boundaries based on percentages: Takeoff (0-15%), Mid-flight (15-85%), Landing (85-100%).
         * **Step 2: Check for anomaly-related terms (e.g., "issues", "errors", "anomalies", "critical").**
             * **IF YES (e.g., "errors during mid-flight"):**
-                * Thought: The query involves anomalies/errors in a specific flight phase. Use `detect_anomalies` with the phase's time_boot_ms range. 
-                * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"], "time_boot_ms_range"}}
+                * Thought: The query involves anomalies/errors in a specific flight phase. Use `detect_anomalies` with the phase's time_boot_ms range.
+                * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"], "time_boot_ms_range": {{"start": start_time, "end": end_time}}}}
                 * Observation: [Results from detect_anomalies - each result includes time_boot_ms when available in the table]
-                * Thought: Filter the anomaly results to only include those within the flight phase time range (min_time to max_time from Step 1). The results include time_boot_ms for each detected anomaly, so I can filter them based on the calculated phase boundaries.
-                * Final Answer: Summarize anomalies found in the specified phase after filtering by time_boot_ms range. If none found within the time range, state clearly.
+                * Thought: CRITICALLY IMPORTANT - I MUST carefully examine each anomaly's time_boot_ms value to confirm it falls within my calculated phase boundaries.
+                  * For each anomaly in the results, check if its time_boot_ms value is between start_time and end_time
+                  * Only count and analyze anomalies whose time_boot_ms values are within the specified range
+                  * Ignore any anomalies outside this range, even if returned by the detect_anomalies tool
+                  * DO NOT trust that the detect_anomalies tool has filtered the results correctly - I must manually verify each time_boot_ms value
+                * Final Answer: Summarize ONLY anomalies with time_boot_ms values within the flight phase time range. State clearly if no anomalies fall within the specified phase.
             * **IF NO (e.g., "battery voltage during mid-flight"):**
                 * Thought: The query is about specific metrics in a flight phase, not anomalies.
                 * Action: `query_duckdb` with query="SELECT AVG([column]), MIN([column]), MAX([column]) FROM [table] WHERE time_boot_ms BETWEEN [start_time] AND [end_time]"
@@ -159,7 +183,7 @@ Final Answer: the final answer to the original input question, grounded in the d
         * **TERMINATE HERE**: Exit the decision tree after handling a phase-specific query. Do NOT proceed to other branches, including Detailed Multi-Category Investigation.
 
 * **Is the query a broad request for "critical errors", "anomalies", "flight issues", "problems", "warnings", "failures", "malfunctions", "incidents", "troubles", "concerns", "errors", "faults", "defects", "issues", or similar general problems?**
-    * **YES (Broad Query):** 
+    * **YES (Broad Query):**
         * Thought: The user's query is a broad request for general anomalies or errors. Use `detect_anomalies` for comprehensive analysis.
         * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]}}
         * Observation: [Results from `detect_anomalies` showing anomalies across all tables]
@@ -167,7 +191,7 @@ Final Answer: the final answer to the original input question, grounded in the d
         * Final Answer: Summarize all significant anomalies. If none, state clearly.
         * **IMPORTANT: Trust the model results completely.** Do not perform additional queries to verify.
         * **TERMINATE HERE**: Exit the decision tree after handling a phase-specific query. Do NOT proceed to other branches, including Detailed Multi-Category Investigation.
-            
+
     * **YES, BUT SPECIFIC TO ONE SYSTEM (e.g., "GPS issues", "attitude problems"):**
         * Thought: The user is asking about anomalies in a specific system. Use targeted `detect_anomalies`.
         * Action: `detect_anomalies` with input={{"db_path": "[path_to_db]", "tables": ["relevant_table_name"]}})
@@ -204,6 +228,20 @@ When the query is specific (e.g., "What was the battery voltage?", "Analyze roll
 IMPORTANT: Action Input must be valid JSON. Examples:
 For query_duckdb: {{"db_path": "/path/to/database.duckdb", "query": "SELECT * FROM table_name"}}
 For detect_anomalies: {{"db_path": "/path/to/database.duckdb"}} or {{"db_path": "/path/to/database.duckdb", "tables": ["table1"], "time_boot_ms_range": {{"start": [start_time], "end": [end_time]}}}}
+
+**CRITICAL TIME FILTERING REMINDER:**
+- Even when providing time_boot_ms_range to detect_anomalies, you MUST still manually verify each anomaly's time_boot_ms value
+- The backend filtering might not be perfect, so you are responsible for final verification
+- Count and report ONLY anomalies that fall within your specified time range
+- Time range filters apply ONLY to the current question - each new user question COMPLETELY RESETS all filters
+- When the user asks about anomalies without specifying a time range, you MUST analyze ALL anomalies in the ENTIRE flight data
+- CONTEXT SEPARATION PROTOCOL: Treat each question as if you've never seen a time filter before
+
+**CONTEXT RESET PROTOCOL FOR NEW QUESTIONS:**
+1. DISCARD all previous time_boot_ms_range filters
+2. ASSUME the question refers to the ENTIRE flight unless explicitly stated otherwise
+3. DO NOT reference previous time-filtered results unless the user explicitly refers to them
+4. ALWAYS run a fresh detect_anomalies without time_boot_ms_range for general questions about anomalies
 
 Scratchpad (previous analysis context):
 {agent_scratchpad_content}
@@ -519,6 +557,10 @@ class DetectAnomaliesBatchInput(BaseModel):
         default=None,
         description="List of tables to analyze. If None, will use priority tables",
     )
+    time_boot_ms_range: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Optional time range to filter anomalies by time_boot_ms values. Format: {'start': start_time, 'end': end_time}",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -575,8 +617,277 @@ class DetectAnomaliesBatchInput(BaseModel):
 anomalies_detector_instance: Dict[str, Optional[AnomalyDetector]] = {"instance": None}
 
 
+def summarize_anomaly_results(
+    result: Dict[str, Any],
+    tables_processed: int,
+    anomalies_found: int,
+    total_rows: int,
+    time_boot_ms_range: Optional[Dict[str, int]] = None
+) -> Dict[str, Any]:
+    """Summarize anomaly detection results into a more compact format with time-based insights.
+    
+    This function creates a simplified representation of anomaly detection results
+    while preserving essential information including time_boot_ms values,
+    enhancing time-based patterns for better LLM understanding, and filtering anomalies
+    by time_boot_ms range when specified. If time_boot_ms_range is provided, the function
+    will clearly mark the results as time-filtered to prevent context contamination.
+
+    Args:
+        result: The original anomaly detection result
+        tables_processed: Number of tables that were processed
+        anomalies_found: Total number of anomalies found
+        total_rows: Total number of rows analyzed
+        time_boot_ms_range: Optional time range filter to apply (start and end timestamps)
+
+    Returns:
+        Dict[str, Any]: A simplified version of the anomaly results with time-based insights
+    """
+    # Create an ultra-minimal version with only what the agent needs
+    # This preserves just enough structure for the agent while drastically reducing size
+    
+    # Track filtered anomaly count if time range filtering is applied
+    filtered_anomaly_count = 0
+    original_anomaly_count = anomalies_found
+    has_time_filtering = time_boot_ms_range is not None
+    anomaly_details = []
+    tables_with_time_data = 0
+    tables_without_time_data = 0
+
+    simplified_result = {
+        "status": result.get("status", ""),
+        "summary": f"Anomaly detection completed on {tables_processed} tables. Found {anomalies_found} anomalies across {total_rows} rows.",
+        "anomalies_found": anomalies_found,
+        "tables_summary": [],
+        "includes_time_boot_ms": True,
+        "time_insights": {},
+        "context_type": "full_dataset" if not time_boot_ms_range else "time_filtered"
+    }
+
+    # Add time_boot_ms_range if provided - with context boundary markers
+    if time_boot_ms_range:
+        simplified_result["time_boot_ms_range"] = time_boot_ms_range
+        simplified_result["time_filtered"] = True
+        simplified_result["context_boundary"] = "QUERY_SPECIFIC_FILTER_ONLY"
+        simplified_result["filter_warning"] = "THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION AND MUST BE DISCARDED FOR NEW QUESTIONS"
+
+    # Track global time range and clusters for all anomalies
+    all_anomaly_times = []
+    time_clusters = []
+
+    # Add only the most essential details for each table
+    for table_name, table_result in result.get("results", {}).items():
+        table_anomalies = table_result.get("anomaly_count", 0)
+        # Only include tables with anomalies to further reduce size
+        if table_anomalies > 0:
+            table_summary = {
+                "table": table_name,
+                "anomalies": table_anomalies
+            }
+
+            # Track time-related data for this table
+            table_anomaly_times = []
+
+            # Include anomaly details with time_boot_ms if available
+            if "data" in table_result:
+                anomaly_details = []
+                for row in table_result["data"]:
+                    if row.get("is_anomaly", False):
+                        anomaly_detail = {
+                            "row_index": row.get("row_index"),
+                            "anomaly_score": row.get("anomaly_score")
+                        }
+                        # Include time_boot_ms if available
+                        if "time_boot_ms" in row:
+                            time_ms = row["time_boot_ms"]
+                            anomaly_detail["time_boot_ms"] = time_ms
+
+                            # Track times for analysis
+                            if time_ms is not None:
+                                # Only include anomalies within the specified time range if provided
+                                include_anomaly = True
+                                in_time_range = True
+                                if time_boot_ms_range:
+                                    start = time_boot_ms_range.get('start')
+                                    end = time_boot_ms_range.get('end')
+                                    if (start is not None and time_ms < start) or (end is not None and time_ms > end):
+                                        in_time_range = False
+                                        include_anomaly = False
+                                    elif row.get("is_anomaly", False):
+                                        # Count anomalies that are in the time range
+                                        filtered_anomaly_count += 1
+
+                                # Mark anomalies with their time range status
+                                if time_boot_ms_range:
+                                    anomaly_detail["in_time_range"] = in_time_range
+                                    # Track that this table has time data
+                                    if "time_boot_ms" in row:
+                                        tables_with_time_data += 1
+
+                                if include_anomaly:
+                                    table_anomaly_times.append(time_ms)
+                                    all_anomaly_times.append((time_ms, table_name))
+
+                        anomaly_details.append(anomaly_detail)
+
+                if anomaly_details:
+                    table_summary["anomaly_details"] = anomaly_details
+
+            # Add time analysis for this table if we have time data
+            if table_anomaly_times:
+                table_summary["time_range"] = {
+                    "min": min(table_anomaly_times),
+                    "max": max(table_anomaly_times),
+                    "duration_ms": max(table_anomaly_times) - min(table_anomaly_times)
+                }
+
+                # Check for time clusters in this table (anomalies occurring close together)
+                if len(table_anomaly_times) >= 2:
+                    sorted_times = sorted(table_anomaly_times)
+                    clusters = []
+                    current_cluster = [sorted_times[0]]
+
+                    # Use a threshold of 5000ms (5 seconds) to consider anomalies part of the same cluster
+                    time_threshold = 5000
+
+                    for i in range(1, len(sorted_times)):
+                        if sorted_times[i] - sorted_times[i-1] <= time_threshold:
+                            current_cluster.append(sorted_times[i])
+                        else:
+                            if len(current_cluster) >= 2:  # Only consider clusters with 2+ anomalies
+                                clusters.append({
+                                    "start_time": min(current_cluster),
+                                    "end_time": max(current_cluster),
+                                    "count": len(current_cluster)
+                                })
+                            current_cluster = [sorted_times[i]]
+
+                    # Add the last cluster if it exists
+                    if len(current_cluster) >= 2:
+                        clusters.append({
+                            "start_time": min(current_cluster),
+                            "end_time": max(current_cluster),
+                            "count": len(current_cluster)
+                        })
+
+                    if clusters:
+                        table_summary["time_clusters"] = clusters
+                        time_clusters.extend([(c["start_time"], c["end_time"], table_name) for c in clusters])
+
+            # Add filtered anomaly count to table summary if filtering was applied
+            if time_boot_ms_range and anomaly_details:
+                # Check if this table has time_boot_ms values
+                has_time_data = any("time_boot_ms" in detail for detail in anomaly_details)
+                
+                if has_time_data:
+                    in_range_anomalies = sum(1 for detail in anomaly_details if detail.get("in_time_range", False))
+                    table_summary["in_time_range_anomalies"] = in_range_anomalies
+                    table_summary["total_anomalies"] = len([d for d in anomaly_details if d.get("is_anomaly", False)])
+                else:
+                    # If no time_boot_ms values in this table, mark all anomalies as in range
+                    # because we can't filter them by time
+                    anomaly_count = sum(1 for detail in anomaly_details if detail.get("is_anomaly", False))
+                    table_summary["in_time_range_anomalies"] = anomaly_count
+                    table_summary["total_anomalies"] = anomaly_count
+                    table_summary["no_time_data"] = True
+                    tables_without_time_data += 1
+
+            simplified_result["tables_summary"].append(table_summary)
+
+    # Add global time insights if we have any time data
+    if all_anomaly_times:
+        all_times = [t[0] for t in all_anomaly_times if t[0] is not None]
+        if all_times:
+            # Global time range
+            global_min = min(all_times)
+            global_max = max(all_times)
+
+            simplified_result["time_insights"] = {
+                "global_time_range": {
+                    "min": global_min,
+                    "max": global_max,
+                    "duration_ms": global_max - global_min
+                }
+            }
+            
+            # Also track the filtered count for use in the summary later
+            if has_time_filtering:
+                simplified_result["filtered_anomaly_count"] = filtered_anomaly_count
+                simplified_result["tables_without_time_data"] = tables_without_time_data
+                simplified_result["original_anomaly_count"] = original_anomaly_count
+
+            # Add flight phase estimation if time range is significant
+            if global_max - global_min > 30000:  # If flight is longer than 30 seconds
+                flight_duration = global_max - global_min
+
+                # Create time windows for different flight phases
+                takeoff_end = global_min + (flight_duration * 0.15)  # First 15%
+                landing_start = global_max - (flight_duration * 0.15)  # Last 15%
+
+                # Count anomalies in each phase
+                takeoff_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and t <= takeoff_end)
+                cruise_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and takeoff_end < t < landing_start)
+                landing_anomalies = sum(1 for t, _ in all_anomaly_times if t is not None and t >= landing_start)
+
+                simplified_result["time_insights"]["flight_phases"] = {
+                    "takeoff": {
+                        "start_time": global_min,
+                        "end_time": int(takeoff_end),
+                        "anomalies": takeoff_anomalies
+                    },
+                    "cruise": {
+                        "start_time": int(takeoff_end) + 1,
+                        "end_time": int(landing_start) - 1,
+                        "anomalies": cruise_anomalies
+                    },
+                    "landing": {
+                        "start_time": int(landing_start),
+                        "end_time": global_max,
+                        "anomalies": landing_anomalies
+                    }
+                }
+
+                # Identify the most problematic phase
+                phase_counts = [
+                    ("takeoff", takeoff_anomalies),
+                    ("cruise", cruise_anomalies),
+                    ("landing", landing_anomalies)
+                ]
+                most_problematic = max(phase_counts, key=lambda x: x[1])
+                if most_problematic[1] > 0:
+                    simplified_result["time_insights"]["most_problematic_phase"] = most_problematic[0]
+
+            # Cross-table time correlation - identify when multiple tables have anomalies at similar times
+            if len(time_clusters) >= 2:
+                # Look for overlapping clusters across different tables
+                correlated_events = []
+                for i in range(len(time_clusters)):
+                    start1, end1, table1 = time_clusters[i]
+                    for j in range(i+1, len(time_clusters)):
+                        start2, end2, table2 = time_clusters[j]
+                        # Check for overlap
+                        if (start1 <= end2 and start2 <= end1) and table1 != table2:
+                            overlap_start = max(start1, start2)
+                            overlap_end = min(end1, end2)
+                            correlated_events.append({
+                                "tables": [table1, table2],
+                                "time_range": [overlap_start, overlap_end],
+                                "duration_ms": overlap_end - overlap_start
+                            })
+
+                if correlated_events:
+                    simplified_result["time_insights"]["correlated_anomalies"] = correlated_events
+
+    return simplified_result
+
 def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
     """Detect anomalies across multiple tables efficiently.
+    
+    IMPORTANT CONTEXT BOUNDARY RULE: Results from this function with time_boot_ms_range
+    filters apply ONLY to the specific query that generated them. Time filters must NEVER
+    be carried over to new questions.
+
+    CONTEXT SEPARATION PROTOCOL: Each invocation of this function represents a fresh context.
+    Previous time filters DO NOT APPLY to new function calls unless explicitly provided again.
 
     This function processes the most important tables where anomalies are likely to occur,
     analyzing all available data for comprehensive anomaly detection. It's ideal for
@@ -720,23 +1031,87 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
             total_rows=total_rows,
         )
 
-        # Create an ultra-minimal version with only what the agent needs
-        # This preserves just enough structure for the agent while drastically reducing size
-        simplified_result = {
-            "status": result.get("status", ""),
-            "summary": f"Anomaly detection completed on {tables_processed} tables. Found {anomalies_found} anomalies across {total_rows} rows.",
-            "anomalies_found": anomalies_found,
-            "tables_summary": [],
-        }
+        # Use the summarize_anomaly_results function to create a simplified result
+        try:
+            simplified_result = summarize_anomaly_results(
+                result,
+                tables_processed,
+                anomalies_found,
+                total_rows,
+                parsed_args.time_boot_ms_range
+            )
+        except Exception as e:
+            logger.error(f"Error in time range filtering: {str(e)}", exc_info=True)
+            # Fall back to unfiltered results if filtering fails
+            simplified_result = summarize_anomaly_results(
+                result,
+                tables_processed,
+                anomalies_found,
+                total_rows
+            )
 
-        # Add only the most essential details for each table
-        for table_name, table_result in result.get("results", {}).items():
-            table_anomalies = table_result.get("anomaly_count", 0)
-            # Only include tables with anomalies to further reduce size
-            if table_anomalies > 0:
-                simplified_result["tables_summary"].append(
-                    {"table": table_name, "anomalies": table_anomalies}
+        # Add a time-based summary to help the LLM understand anomaly patterns
+        time_insights_summary = []
+        if "time_insights" in simplified_result and simplified_result["time_insights"]:
+            insights = simplified_result["time_insights"]
+
+            # Add time range filter information if it was provided
+            if parsed_args.time_boot_ms_range:
+                start = parsed_args.time_boot_ms_range.get('start', 'N/A')
+                end = parsed_args.time_boot_ms_range.get('end', 'N/A')
+                filtered_count = simplified_result.get("filtered_anomaly_count", 0)
+            
+                time_insights_summary.append(f"[THIS QUERY ONLY] FILTERED TO TIME RANGE: {start}-{end}ms. Found {filtered_count} anomalies within this range (out of {anomalies_found} total). THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION.")
+        
+                # Add information about tables without time data if applicable
+                if simplified_result.get("tables_without_time_data", 0) > 0:
+                    time_insights_summary.append(f"Note: {simplified_result.get('tables_without_time_data', 0)} tables didn't have time_boot_ms data and couldn't be filtered by time.")
+            
+                # Add explicit context separation marker
+                simplified_result["context_boundary_marker"] = "TIME_FILTERED_RESULTS_FOR_CURRENT_QUERY_ONLY"
+
+            # Add flight phase information if available
+            if "flight_phases" in insights:
+                phases = insights["flight_phases"]
+                problematic_phase = insights.get("most_problematic_phase")
+
+                if problematic_phase:
+                    phase_data = phases[problematic_phase]
+                    time_insights_summary.append(
+                        f"Most anomalies occurred during {problematic_phase} phase "
+                        f"({phase_data['anomalies']} anomalies between "
+                        f"{phase_data['start_time']}ms and {phase_data['end_time']}ms)."
+                    )
+
+            # Add information about correlated anomalies across tables
+            if "correlated_anomalies" in insights and insights["correlated_anomalies"]:
+                correlated = insights["correlated_anomalies"][0]  # Take the first correlation as an example
+                time_insights_summary.append(
+                    f"Found correlated anomalies between {' and '.join(correlated['tables'])} "
+                    f"at around {correlated['time_range'][0]}ms."
                 )
+
+            # Add the time summary to the main summary if we have insights
+            if time_insights_summary and len(time_insights_summary) > 0:
+                simplified_result["time_summary"] = " ".join(time_insights_summary)
+                # Only add time_summary to summary if it's not already included
+                if simplified_result["time_summary"] not in simplified_result["summary"]:
+                    simplified_result["summary"] += f" {simplified_result['time_summary']}"
+
+        # Add the time_boot_ms_range to the output if it was provided
+        if parsed_args.time_boot_ms_range:
+            simplified_result["time_boot_ms_range"] = parsed_args.time_boot_ms_range
+            # Add explicit context boundary markers
+            simplified_result["query_specific_filter"] = True
+            simplified_result["context_boundary"] = "THIS_RESULT_IS_TIME_FILTERED_FOR_CURRENT_QUERY_ONLY"
+        
+            # Update the summary to emphasize the filtered results
+            if simplified_result.get("filtered_anomaly_count", 0) != anomalies_found:
+                filtered_count = simplified_result.get("filtered_anomaly_count", 0)
+                # Update the summary to highlight filtered results
+                simplified_result["summary"] = f"[TIME-FILTERED RESULT - CURRENT QUERY ONLY] Anomaly detection completed on {tables_processed} tables. Found {filtered_count} anomalies within specified time range ({anomalies_found} total anomalies across {total_rows} rows)."
+                # Replace the anomalies_found count with the filtered count
+                simplified_result["anomalies_found"] = filtered_count
 
         # Return the simplified result - still structured but much smaller
         return simplified_result

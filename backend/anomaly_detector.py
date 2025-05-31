@@ -380,6 +380,7 @@ class AnomalyDetector:
         max_rows: int = DEFAULT_MAX_ROWS,
         contamination: float = DEFAULT_CONTAMINATION,
         wait_for_model: bool = True,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """Detect anomalies in the specified table and columns.
 
@@ -389,6 +390,8 @@ class AnomalyDetector:
             max_rows (int): Maximum number of rows to analyze
             contamination (float): Expected proportion of anomalies
             wait_for_model (bool): Whether to wait for model training to complete before analyzing
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results 
+                                                          with format {'start': start_ms, 'end': end_ms}
 
         Returns:
             Dict[str, Any]: Detection results
@@ -439,16 +442,17 @@ class AnomalyDetector:
                 f"Using cached model for table {table}", columns=numerical_columns
             )
             return await self._apply_cached_model(
-                table, numerical_columns, cached_model_info, max_rows
+                table, numerical_columns, cached_model_info, max_rows, time_boot_ms_range
             )
 
         # No cached model, create a new one
         return await self._create_and_apply_model(
-            table, numerical_columns, max_rows, contamination, wait_for_model
+            table, numerical_columns, max_rows, contamination, wait_for_model, time_boot_ms_range
         )
 
     async def _apply_cached_model(
-        self, table: str, columns: List[str], model_info: Dict[str, Any], max_rows: int
+        self, table: str, columns: List[str], model_info: Dict[str, Any], max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None
     ) -> Dict[str, Any]:
         """Apply a cached model to detect anomalies.
 
@@ -457,6 +461,8 @@ class AnomalyDetector:
             columns (List[str]): Columns to analyze
             model_info (Dict[str, Any]): Cached model information
             max_rows (int): Maximum number of rows to analyze
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results
+                                                          with format {'start': start_ms, 'end': end_ms}
 
         Returns:
             Dict[str, Any]: Detection results
@@ -520,8 +526,9 @@ class AnomalyDetector:
         table: str,
         columns: List[str],
         max_rows: int,
-        contamination: float,
+        contamination: float = DEFAULT_CONTAMINATION,
         wait_for_model: bool = True,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Create a new anomaly detection model, apply it to the data, and cache it for future use.
@@ -643,17 +650,20 @@ class AnomalyDetector:
             return {"status": "error", "message": f"Failed to create model: {str(e)}"}
 
     async def _get_table_data(
-        self, table: str, columns: List[str], max_rows: int
+        self, table: str, columns: List[str], max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None
     ) -> pd.DataFrame:
-        """Get data from a table with an optional row limit.
+        """Get data from the specified table and columns.
 
         Args:
             table (str): Table name
-            columns (List[str]): Columns to fetch
-            max_rows (int): Maximum number of rows to fetch
+            columns (List[str]): Columns to retrieve
+            max_rows (int): Maximum number of rows to retrieve
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results
+                                                          with format {'start': start_ms, 'end': end_ms}
 
         Returns:
-            pd.DataFrame: Table data
+            pd.DataFrame: DataFrame containing the requested data
         """
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
@@ -664,18 +674,21 @@ class AnomalyDetector:
             return pd.DataFrame()
 
     async def _get_table_data_with_sampling(
-        self, table: str, columns: List[str], max_rows: int
+        self, table: str, columns: List[str], max_rows: int,
+        time_boot_ms_range: Optional[Dict[str, int]] = None
     ) -> Tuple[pd.DataFrame, bool]:
         """Get data from a table with sampling for large tables.
 
-        Args:
-            table (str): Table name
-            columns (List[str]): Columns to fetch
-            max_rows (int): Maximum number of rows to fetch
+Args:
+    table (str): Table name
+    columns (List[str]): Columns to fetch
+    max_rows (int): Maximum number of rows to fetch
+    time_boot_ms_range (Dict[str, int], optional): Time range to filter results 
+                                                  with format {'start': start_ms, 'end': end_ms}
 
-        Returns:
-            Tuple[pd.DataFrame, bool]: Table data and whether sampling was applied
-        """
+Returns:
+    Tuple[pd.DataFrame, bool]: Table data and whether sampling was applied
+"""
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 # Get row count
@@ -719,6 +732,7 @@ class AnomalyDetector:
         max_rows_per_table: int = 0,  # 0 means use all available data
         contamination: float = DEFAULT_CONTAMINATION,
         time_limit_seconds: float = DEFAULT_TIME_LIMIT_SECONDS,
+        time_boot_ms_range: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Detect anomalies across multiple tables with a time limit.
@@ -731,6 +745,8 @@ class AnomalyDetector:
             max_rows_per_table (int): Maximum rows to analyze per table
             contamination (float): Expected proportion of anomalies
             time_limit_seconds (float): Maximum time to spend on analysis
+            time_boot_ms_range (Dict[str, int], optional): Time range to filter results
+                                                          with format {'start': start_ms, 'end': end_ms}
 
         Returns:
             Dict[str, Any]: Combined detection results
@@ -788,6 +804,7 @@ class AnomalyDetector:
                     max_rows=max_rows_per_table,
                     contamination=contamination,
                     wait_for_model=True,  # Wait for models to get immediate results
+                    time_boot_ms_range=time_boot_ms_range,
                 )
 
                 # Add results
@@ -842,9 +859,11 @@ class AnomalyDetector:
                 "is_anomaly": bool(is_anomaly),
                 "anomaly_score": float(anomaly_scores[i]),
             }
-            # Include time_boot_ms if available
-            if "time_boot_ms" in df.columns:
-                result["time_boot_ms"] = int(df["time_boot_ms"].iloc[i])
+
+            # Add time_boot_ms to the result if it exists in the dataframe
+            if 'time_boot_ms' in df.columns:
+                result["time_boot_ms"] = int(df.iloc[i]['time_boot_ms']) if not pd.isna(df.iloc[i]['time_boot_ms']) else None
+
             results.append(result)
             if is_anomaly:
                 anomaly_count += 1
