@@ -80,6 +80,8 @@ The **UAV Log Viewer** backend implements a clean, modular architecture optimize
 
 - **💭 Memory Manager**: Multi-tier memory system that combines token-aware buffering with a three-level strategy to maintain context across conversation turns.
 
+- **📝 AgentScratchpad**: Tracks the agent’s reasoning steps across multi-turn conversations by storing actions and observations in a structured format, helping maintain context and avoid repetition.
+
 - **📱 WebSocket Handler**: Bidirectional communication layer for real-time token streaming with proper connection lifecycle management and HTTP fallback mechanisms.
 
 ### Data Flow
