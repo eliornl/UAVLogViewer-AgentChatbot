@@ -81,7 +81,7 @@ class AnomalyDetector:
         """
         try:
             # Preload table schemas asynchronously - this is fast
-            await asyncio.to_thread(self._preload_table_schemas)
+            await self._preload_table_schemas()
             self.logger.info("AnomalyDetector schemas loaded", db_path=self.db_path)
 
             # Start background tasks to train models for priority tables
@@ -197,20 +197,24 @@ class AnomalyDetector:
             # Remove from in-progress set
             self.training_in_progress.discard(cache_key)
 
-    def _preload_table_schemas(self) -> None:
+    async def _preload_table_schemas(self) -> None:
         """Preload all table schemas from the database to avoid repeated queries."""
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 # Get all tables
-                tables_result = conn.execute(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-                ).fetchall()
+                tables_result = await asyncio.to_thread(
+                    lambda: conn.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+                    ).fetchall()
+                )
                 tables = [table[0] for table in tables_result]
 
                 # For each table, get its schema
                 for table in tables:
                     try:
-                        columns_result = conn.execute(f"DESCRIBE {table}").fetchall()
+                        columns_result = await asyncio.to_thread(
+                            lambda: conn.execute(f"DESCRIBE {table}").fetchall()
+                        )
                         self.table_schemas[table] = [col[0] for col in columns_result]
 
                         # Pre-identify numerical columns
@@ -218,7 +222,9 @@ class AnomalyDetector:
                         for col in self.table_schemas[table]:
                             try:
                                 # Test if column is numerical
-                                conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                                await asyncio.to_thread(
+                                    lambda: conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                                )
                                 numerical_cols.append(col)
                             except:
                                 # Not a numerical column, skip
@@ -323,7 +329,7 @@ class AnomalyDetector:
 
     # Cache the model method is already defined above
 
-    def get_numerical_columns(
+    async def get_numerical_columns(
         self, table: str, requested_columns: List[str]
     ) -> List[str]:
         """Get numerical columns for a table, using cache if available.
@@ -337,21 +343,23 @@ class AnomalyDetector:
         """
         # If we have cached numerical columns for this table
         if table in self.numerical_columns_cache:
-            # Filter by requested columns
+            # Return only the columns that were requested and are in the cache
             return [
                 col
                 for col in requested_columns
                 if col in self.numerical_columns_cache[table]
             ]
 
-        # Otherwise, we need to determine numerical columns
+        # Otherwise, identify numerical columns dynamically
         numerical_columns = []
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 for col in requested_columns:
                     try:
                         # Test if column is numerical
-                        conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                        await asyncio.to_thread(
+                            lambda: conn.execute(f"SELECT AVG({col}) FROM {table} LIMIT 1")
+                        )
                         numerical_columns.append(col)
                     except:
                         # Not a numerical column, skip
@@ -368,7 +376,7 @@ class AnomalyDetector:
 
         except Exception as e:
             self.logger.error(
-                f"Error determining numerical columns for table {table}", error=str(e)
+                f"Error identifying numerical columns for table {table}", error=str(e)
             )
 
         return numerical_columns
@@ -406,7 +414,9 @@ class AnomalyDetector:
                 # Try to load schema on demand
                 with duckdb.connect(self.db_path, read_only=True) as conn:
                     try:
-                        columns_result = conn.execute(f"DESCRIBE {table}").fetchall()
+                        columns_result = await asyncio.to_thread(
+                            lambda: conn.execute(f"DESCRIBE {table}").fetchall()
+                        )
                         self.table_schemas[table] = [col[0] for col in columns_result]
                     except duckdb.Error:
                         return {
@@ -428,7 +438,7 @@ class AnomalyDetector:
             }
 
         # Get numerical columns
-        numerical_columns = self.get_numerical_columns(table, valid_columns)
+        numerical_columns = await self.get_numerical_columns(table, valid_columns)
         if not numerical_columns:
             return {
                 "status": "error",
@@ -668,7 +678,7 @@ class AnomalyDetector:
         try:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 query = f"SELECT {', '.join(columns)} FROM {table} LIMIT {max_rows}"
-                return conn.execute(query).fetchdf()
+                return await asyncio.to_thread(lambda: conn.execute(query).fetchdf())
         except Exception as e:
             self.logger.error(f"Error fetching data from table {table}", error=str(e))
             return pd.DataFrame()
@@ -693,9 +703,11 @@ Returns:
             with duckdb.connect(self.db_path, read_only=True) as conn:
                 # Get row count
                 try:
-                    row_count = conn.execute(
-                        f"SELECT COUNT(*) FROM {table}"
-                    ).fetchone()[0]
+                    row_count = await asyncio.to_thread(
+                        lambda: conn.execute(
+                            f"SELECT COUNT(*) FROM {table}"
+                        ).fetchone()[0]
+                    )
                     self.logger.info(f"Table {table} has {row_count} rows")
                 except:
                     row_count = 0
@@ -718,7 +730,7 @@ Returns:
 
                 # Fetch data
                 query = f"SELECT {', '.join(columns)} FROM {table}{sample_clause}{limit_clause}"
-                df = conn.execute(query).fetchdf()
+                df = await asyncio.to_thread(lambda: conn.execute(query).fetchdf())
 
                 return df, sampling_applied
 
@@ -728,7 +740,7 @@ Returns:
 
     async def detect_anomalies_batch(
         self,
-        tables: List[str] = None,
+        tables: Optional[List[str]] = None,
         max_rows_per_table: int = 0,  # 0 means use all available data
         contamination: float = DEFAULT_CONTAMINATION,
         time_limit_seconds: float = DEFAULT_TIME_LIMIT_SECONDS,
@@ -790,7 +802,7 @@ Returns:
             # Get numerical columns for this table
             try:
                 all_columns = self.table_schemas.get(table, [])
-                numerical_columns = self.get_numerical_columns(table, all_columns)
+                numerical_columns = await self.get_numerical_columns(table, all_columns)
 
                 if not numerical_columns:
                     self.logger.warning(f"No numerical columns found in table {table}")

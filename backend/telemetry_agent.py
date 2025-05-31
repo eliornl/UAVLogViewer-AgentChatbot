@@ -418,7 +418,7 @@ query_result_cache = {}
 # Maximum size for the query cache to prevent memory issues
 MAX_QUERY_CACHE_SIZE = 2
 
-def query_duckdb(tool_input: Any) -> Dict[str, Any]:
+async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     """Execute a SQL query on a DuckDB database with optimized performance.
 
     Args:
@@ -510,7 +510,9 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             if table_match:
                 table_name = table_match.group(1)
                 # Check if table exists
-                table_exists = conn.execute(f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')").fetchone()[0]
+                table_exists = await asyncio.to_thread(
+                    lambda: conn.execute(f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')").fetchone()[0]
+                )
                 if not table_exists:
                     return {
                         "status": "error",
@@ -518,7 +520,7 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                     }
 
         # Execute query with optimized result handling
-        result = conn.execute(query).fetchall()
+        result = await asyncio.to_thread(lambda: conn.execute(query).fetchall())
         columns = [desc[0] for desc in conn.description] if conn.description else []
 
         # Use list comprehension for better performance
@@ -1141,9 +1143,29 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
 # The _fast_statistical_anomaly_detection function has been removed as it was only used by the detect_anomalies_ml function
 
 
-# Register tools for LangChain - all functions are now synchronous
+# Create sync wrapper for async query_duckdb function to work with LangChain tools
+def query_duckdb_sync(tool_input: Any) -> Dict[str, Any]:
+    """Synchronous wrapper for async query_duckdb function."""
+    import asyncio
+    try:
+        # Get the current event loop if one exists
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # If we're already in an async context, we need to run in a thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, query_duckdb(tool_input))
+                return future.result()
+        else:
+            # If no loop is running, we can run directly
+            return asyncio.run(query_duckdb(tool_input))
+    except RuntimeError:
+        # Fallback for when there's no event loop
+        return asyncio.run(query_duckdb(tool_input))
+
+# Register tools for LangChain - using sync wrapper for async functions
 query_duckdb_tool: StructuredTool = StructuredTool.from_function(
-    func=query_duckdb,
+    func=query_duckdb_sync,
     name="query_duckdb",
     description=(
         "Execute a SQL query on a DuckDB database. Use this to fetch telemetry data. "
@@ -1406,7 +1428,7 @@ class TelemetryAgent:
                 f"max_tokens {self.max_tokens} must be greater than RESERVED_RESPONSE_TOKENS {RESERVED_RESPONSE_TOKENS}"
             )
 
-    def _fetch_actual_schema_for_table(self, table_name: str) -> List[str]:
+    async def _fetch_actual_schema_for_table(self, table_name: str) -> List[str]:
         """Connects to DB and fetches actual column names for a given table.
         Returns a list of column names, or an empty list if fetching fails or table not found.
         """
@@ -1421,13 +1443,17 @@ class TelemetryAgent:
                 return []
 
             with duckdb.connect(self.db_path, read_only=True) as conn:
-                tables_result = conn.execute(
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main';"
-                ).fetchall()
+                tables_result = await asyncio.to_thread(
+                    lambda: conn.execute(
+                        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main';"
+                    ).fetchall()
+                )
                 available_tables = [t[0].lower() for t in tables_result]
 
                 if table_name.lower() in available_tables:
-                    columns_data = conn.execute(f"DESCRIBE {table_name};").fetchall()
+                    columns_data = await asyncio.to_thread(
+                        lambda: conn.execute(f"DESCRIBE {table_name};").fetchall()
+                    )
                     actual_column_names = [col_data[0] for col_data in columns_data]
                     self.logger.info(
                         f"Dynamically fetched schema for {table_name}",
@@ -1482,10 +1508,7 @@ class TelemetryAgent:
             table_name = table_meta_static["table"]
 
             # Fetch actual column names dynamically using the helper method
-            # Run the synchronous DB operation in a separate thread
-            actual_columns = await asyncio.to_thread(
-                self._fetch_actual_schema_for_table, table_name
-            )
+            actual_columns = await self._fetch_actual_schema_for_table(table_name)
 
             if actual_columns:  # If columns were found (either dynamic or fallback)
                 column_names_str = ", ".join(actual_columns)

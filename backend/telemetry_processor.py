@@ -194,7 +194,7 @@ class TelemetryProcessor:
             )
 
             # Create and save DataFrames for each message type
-            def save_to_duckdb() -> None:
+            async def save_to_duckdb() -> None:
                 # Prepare DuckDB database path
                 os.makedirs(storage_dir, exist_ok=True)
                 db_path = os.path.join(
@@ -248,10 +248,12 @@ class TelemetryProcessor:
 
                         # Check if the table exists
                         table_exists = (
-                            conn.execute(
-                                "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
-                                (table_name,),
-                            ).fetchone()[0]
+                            await asyncio.to_thread(
+                                lambda: conn.execute(
+                                    "SELECT COUNT(*) FROM duckdb_tables() WHERE table_name = ?",
+                                    (table_name,),
+                                ).fetchone()[0]
+                            )
                             > 0
                         )
 
@@ -267,7 +269,7 @@ class TelemetryProcessor:
                             )
                             """
                             try:
-                                conn.execute(create_table_query)
+                                await asyncio.to_thread(lambda: conn.execute(create_table_query))
                             except Exception as e:
                                 session_logger.error(
                                     "Failed to create table",
@@ -286,25 +288,27 @@ class TelemetryProcessor:
                             )
 
                         # Insert data into table via temporary view
-                        conn.register("df_view", df)
-                        conn.execute(
-                            f"INSERT INTO {quoted_table_name} SELECT * FROM df_view"
+                        await asyncio.to_thread(lambda: conn.register("df_view", df))
+                        await asyncio.to_thread(
+                            lambda: conn.execute(
+                                f"INSERT INTO {quoted_table_name} SELECT * FROM df_view"
+                            )
                         )
-                        conn.unregister("df_view")
+                        await asyncio.to_thread(lambda: conn.unregister("df_view"))
                         session_logger.info(
                             "Saved telemetry data",
                             table_name=table_name,
                             msg_type=msg_type,
                             row_count=len(df),
                         )
-                        conn.commit()
+                        await asyncio.to_thread(lambda: conn.commit())
                         
                         # Note: Indexes for time_boot_ms are created separately via
                         # create_time_boot_ms_indexes() to avoid timeouts during initial data load
 
             try:
                 await asyncio.wait_for(
-                    asyncio.to_thread(save_to_duckdb),
+                    save_to_duckdb(),
                     timeout=TelemetryProcessor.SAVE_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
@@ -385,27 +389,31 @@ class TelemetryProcessor:
                 raise ValueError(TelemetryProcessor.INVALID_DB_PATH_ERROR.format(db_path))
                 
             # Define function to create indexes
-            def create_indexes() -> None:
+            async def create_indexes() -> None:
                 with duckdb.connect(db_path) as conn:
                     # Get list of all tables with time_boot_ms column in a single query
-                    table_columns = conn.execute("""
-                        SELECT t.table_name, c.column_name 
-                        FROM duckdb_tables() t 
-                        JOIN duckdb_columns() c ON t.table_name = c.table_name 
-                        WHERE t.table_name LIKE 'telemetry_%' 
-                        AND c.column_name = 'time_boot_ms'
-                    """).fetchall()
+                    table_columns = await asyncio.to_thread(
+                        lambda: conn.execute("""
+                            SELECT t.table_name, c.column_name 
+                            FROM duckdb_tables() t 
+                            JOIN duckdb_columns() c ON t.table_name = c.table_name 
+                            WHERE t.table_name LIKE 'telemetry_%' 
+                            AND c.column_name = 'time_boot_ms'
+                        """).fetchall()
+                    )
                     
                     # Create a single transaction for all indexes
-                    conn.execute("BEGIN TRANSACTION")
+                    await asyncio.to_thread(lambda: conn.execute("BEGIN TRANSACTION"))
                     
                     created_count = 0
                     for table_name, _ in table_columns:
                         try:
                             # Create index if it doesn't exist
                             index_name = f"{table_name}_time_boot_ms_idx"
-                            conn.execute(
-                                f"CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\"(time_boot_ms)"
+                            await asyncio.to_thread(
+                                lambda: conn.execute(
+                                    f"CREATE INDEX IF NOT EXISTS \"{index_name}\" ON \"{table_name}\"(time_boot_ms)"
+                                )
                             )
                             created_count += 1
                             session_logger.debug(
@@ -422,7 +430,7 @@ class TelemetryProcessor:
                             # Continue with other tables even if this one fails
                     
                     # Commit all index creations at once
-                    conn.execute("COMMIT")
+                    await asyncio.to_thread(lambda: conn.execute("COMMIT"))
                     
                     session_logger.info(
                         "Created time_boot_ms indexes",
@@ -432,7 +440,7 @@ class TelemetryProcessor:
             
             # Execute index creation with timeout
             await asyncio.wait_for(
-                asyncio.to_thread(create_indexes),
+                create_indexes(),
                 timeout=120.0  # 2 minutes timeout for index creation
             )
             
