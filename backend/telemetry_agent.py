@@ -52,6 +52,7 @@ CHAT_TIMEOUT_SECONDS: float = 60.0  # Timeout for agent processing, including ML
 
 # Output formatting constants
 MAX_TOOL_OUTPUT_ROWS: int = 50  # Max rows for query_duckdb and detect_anomalies output
+EARLY_TRUNCATION: bool = True  # Enable early truncation of results for better performance
 
 # Error message constants
 ERROR_EMPTY_MESSAGE: str = "Empty message provided, skipping processing"
@@ -542,16 +543,41 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                         "message": f"Table '{table_name}' does not exist in this log file. The data you're looking for may not be available."
                     }
 
-        # Execute query with optimized result handling
+        # Execute query with optimized result handling and early truncation
+        if EARLY_TRUNCATION and not query.lower().startswith("select count"):
+            # Add LIMIT clause for early truncation if not already present
+            if "limit" not in query.lower():
+                query = f"{query} LIMIT {MAX_TOOL_OUTPUT_ROWS + 1}"  # +1 to detect if there were more rows
+            
         result = await asyncio.to_thread(lambda: conn.execute(query).fetchall())
         columns = [desc[0] for desc in conn.description] if conn.description else []
 
         # Use list comprehension for better performance
         data_to_return = [dict(zip(columns, row)) for row in result]
-        row_count = len(data_to_return)
+        full_row_count = len(data_to_return)
+        
+        # Apply early truncation if needed
+        if EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS:
+            data_to_return = data_to_return[:MAX_TOOL_OUTPUT_ROWS]
+            logger.debug(
+                "Applied early truncation to query results",
+                original_count=full_row_count,
+                truncated_count=MAX_TOOL_OUTPUT_ROWS
+            )
+        
+        row_count = full_row_count
 
         # Store in cache
-        response = {"status": "success", "data": data_to_return, "row_count": row_count}
+        response = {
+            "status": "success", 
+            "data": data_to_return, 
+            "row_count": row_count,
+            "truncated": EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS
+        }
+        
+        # Add truncation message if needed
+        if EARLY_TRUNCATION and full_row_count > MAX_TOOL_OUTPUT_ROWS:
+            response["message"] = f"Query returned {row_count} rows but only showing first {MAX_TOOL_OUTPUT_ROWS} for performance."
 
         # Cache the response with timestamp and LRU management
         query_result_cache[cache_key] = response
@@ -1071,17 +1097,26 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
         finally:
             loop.close()
 
-        # Truncate results to avoid excessive token usage
+        # Apply early truncation to results to reduce processing time
         if "results" in result:
             for table_name, table_result in result["results"].items():
                 if (
                     "data" in table_result
                     and len(table_result["data"]) > MAX_TOOL_OUTPUT_ROWS
                 ):
+                    # Truncate data and add metadata
+                    original_count = len(table_result["data"])
                     table_result["data"] = table_result["data"][:MAX_TOOL_OUTPUT_ROWS]
                     table_result["displayed_row_count"] = MAX_TOOL_OUTPUT_ROWS
+                    table_result["truncated"] = True
                     table_result["message"] = (
-                        f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} anomaly detection results. Original result count: {table_result.get('row_count', 0)}."
+                        f"Output truncated to first {MAX_TOOL_OUTPUT_ROWS} anomaly detection results. Original result count: {table_result.get('row_count', original_count)}."
+                    )
+                    logger.debug(
+                        "Applied truncation to anomaly detection results",
+                        table=table_name,
+                        original_count=original_count,
+                        truncated_count=MAX_TOOL_OUTPUT_ROWS
                     )
 
         logger.info(

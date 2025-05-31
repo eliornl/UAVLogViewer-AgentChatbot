@@ -35,7 +35,7 @@ VECTOR_RETRIEVER_K: int = 4  # Number of results to retrieve from vector store
 
 # Buffer window settings
 DEFAULT_BUFFER_WINDOW_SIZE: int = (
-    10  # Default number of messages to keep in buffer window
+    8  # Default number of messages to keep in buffer window (4 exchanges)
 )
 DEFAULT_TOKEN_LIMIT: int = 1000  # Default token limit for buffer window memory
 
@@ -81,13 +81,16 @@ class CustomBufferWindowMemory(BaseMemory):
         """
         return [self.memory_key]
 
-    def load_memory_variables(self, _: Dict[str, Any]) -> Dict[str, Any]:
+    def load_memory_variables(self, inputs: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Load memory variables from the chat history, keeping messages up to the token limit.
+        Load memory variables from the chat history, keeping only the most recent messages.
 
-        This method retrieves messages from the chat history up to the specified token limit,
+        This method retrieves the most recent messages from the chat history,
         preserving any system message at the beginning. It uses the trim_messages
         function to select messages while maintaining conversation integrity.
+        
+        The sliding window approach ensures we only keep the last 4 exchanges (8 messages)
+        to prevent context bloat and improve performance.
 
         Returns:
             Dict[str, Any]: Dictionary with memory_key mapped to either a list of
@@ -98,7 +101,15 @@ class CustomBufferWindowMemory(BaseMemory):
                                 not fully implemented
         """
         messages = self.chat_memory.messages
-
+        
+        # Apply sliding window - keep only the most recent messages
+        if len(messages) > DEFAULT_BUFFER_WINDOW_SIZE:
+            # Preserve system message if present
+            if messages and hasattr(messages[0], "type") and messages[0].type == "system":
+                messages = [messages[0]] + messages[-DEFAULT_BUFFER_WINDOW_SIZE+1:]
+            else:
+                messages = messages[-DEFAULT_BUFFER_WINDOW_SIZE:]
+                
         # Use token counter if provided, otherwise fall back to message count
         token_counter_fn = self.token_counter
         max_tokens = self.max_token_limit
@@ -274,6 +285,15 @@ class ConversationMemoryManager:
                 user_content, assistant_content = message_pair
                 msg_tokens: int = self.llm_token_encoder.count_tokens([message_pair])
                 self.history.append(message_pair)
+                # Keep only the last 8 messages (4 exchanges) for sliding window memory
+                if len(self.history) > DEFAULT_BUFFER_WINDOW_SIZE:
+                    removed = self.history[0]
+                    self.history = self.history[-DEFAULT_BUFFER_WINDOW_SIZE:]
+                    self.logger.info(
+                        "Applied sliding window memory - removed oldest message",
+                        removed_message=removed[0][:30] + "..." if len(removed[0]) > 30 else removed[0],
+                        window_size=DEFAULT_BUFFER_WINDOW_SIZE,
+                    )
                 self.llm_token_count += msg_tokens
                 self.logger.debug(
                     "Added message pair to history",
@@ -284,6 +304,7 @@ class ConversationMemoryManager:
                         [("", assistant_content)]
                     ),
                     total_tokens=self.llm_token_count,
+                    history_size=len(self.history),
                 )
 
                 expected_strategy: MemoryStrategy = self._get_expected_strategy(

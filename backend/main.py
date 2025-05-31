@@ -59,7 +59,7 @@ CSV_MEDIA_TYPE: str = "text/csv"
 MAX_MESSAGES: int = 10_000  # Limit messages per session to prevent memory issues
 MAX_SESSIONS: int = 1000  # Maximum number of concurrent sessions allowed
 MAX_SESSION_ATTEMPTS: int = 5  # Maximum attempts to generate a unique session ID
-CHAT_TIMEOUT_SECONDS: float = 30.0  # Timeout for chat message processing
+CHAT_TIMEOUT_SECONDS: float = 15.0  # Timeout for chat message processing (reduced for faster error recovery)
 
 # File naming constants
 FILENAME_SAFE_CHARS: str = (
