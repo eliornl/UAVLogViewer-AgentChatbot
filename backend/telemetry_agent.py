@@ -416,7 +416,7 @@ db_connection_cache = {}
 query_result_cache = {}
 
 # Maximum size for the query cache to prevent memory issues
-MAX_QUERY_CACHE_SIZE = 100
+MAX_QUERY_CACHE_SIZE = 2
 
 def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     """Execute a SQL query on a DuckDB database with optimized performance.
@@ -459,11 +459,11 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     # Fast validation without full Pydantic model when possible
     if not isinstance(args_dict, dict):
         return {"status": "error", "message": "Input must be a dictionary."}
-    
+
     # Extract required fields directly when possible
     db_path = args_dict.get("db_path")
     query = args_dict.get("query")
-    
+
     if not db_path or not query:
         # Fall back to full Pydantic validation only when needed
         try:
@@ -499,7 +499,7 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                 oldest_key = next(iter(db_connection_cache))
                 db_connection_cache[oldest_key].close()
                 del db_connection_cache[oldest_key]
-            
+
             conn = duckdb.connect(db_path, read_only=True)
             db_connection_cache[db_path] = conn
 
@@ -513,10 +513,10 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
                 table_exists = conn.execute(f"SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_name = '{table_name}')").fetchone()[0]
                 if not table_exists:
                     return {
-                        "status": "error", 
+                        "status": "error",
                         "message": f"Table '{table_name}' does not exist in this log file. The data you're looking for may not be available."
                     }
-        
+
         # Execute query with optimized result handling
         result = conn.execute(query).fetchall()
         columns = [desc[0] for desc in conn.description] if conn.description else []
@@ -527,16 +527,16 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
 
         # Store in cache
         response = {"status": "success", "data": data_to_return, "row_count": row_count}
-        
+
         # Manage cache size
         if len(query_result_cache) >= MAX_QUERY_CACHE_SIZE:
             # Remove oldest entry (first key)
             oldest_key = next(iter(query_result_cache))
             del query_result_cache[oldest_key]
-            
+
         query_result_cache[cache_key] = response
         return response
-        
+
     except duckdb.Error as e:
         return {"status": "error", "message": f"Query failed: {str(e)}"}
     except Exception as e:
@@ -546,14 +546,14 @@ def query_duckdb(tool_input: Any) -> Dict[str, Any]:
 def clear_query_caches():
     """Clear all query and connection caches."""
     global query_result_cache, db_connection_cache
-    
+
     # Close all database connections
     for conn in db_connection_cache.values():
         try:
             conn.close()
         except:
             pass
-    
+
     # Reset caches
     query_result_cache = {}
     db_connection_cache = {}
@@ -637,7 +637,7 @@ def summarize_anomaly_results(
     time_boot_ms_range: Optional[Dict[str, int]] = None
 ) -> Dict[str, Any]:
     """Summarize anomaly detection results into a more compact format with time-based insights.
-    
+
     This function creates a simplified representation of anomaly detection results
     while preserving essential information including time_boot_ms values,
     enhancing time-based patterns for better LLM understanding, and filtering anomalies
@@ -656,7 +656,7 @@ def summarize_anomaly_results(
     """
     # Create an ultra-minimal version with only what the agent needs
     # This preserves just enough structure for the agent while drastically reducing size
-    
+
     # Track filtered anomaly count if time range filtering is applied
     filtered_anomaly_count = 0
     original_anomaly_count = anomalies_found
@@ -789,7 +789,7 @@ def summarize_anomaly_results(
             if time_boot_ms_range and anomaly_details:
                 # Check if this table has time_boot_ms values
                 has_time_data = any("time_boot_ms" in detail for detail in anomaly_details)
-                
+
                 if has_time_data:
                     in_range_anomalies = sum(1 for detail in anomaly_details if detail.get("in_time_range", False))
                     table_summary["in_time_range_anomalies"] = in_range_anomalies
@@ -820,7 +820,7 @@ def summarize_anomaly_results(
                     "duration_ms": global_max - global_min
                 }
             }
-            
+
             # Also track the filtered count for use in the summary later
             if has_time_filtering:
                 simplified_result["filtered_anomaly_count"] = filtered_anomaly_count
@@ -893,7 +893,7 @@ def summarize_anomaly_results(
 
 def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
     """Detect anomalies across multiple tables efficiently.
-    
+
     IMPORTANT CONTEXT BOUNDARY RULE: Results from this function with time_boot_ms_range
     filters apply ONLY to the specific query that generated them. Time filters must NEVER
     be carried over to new questions.
@@ -1072,13 +1072,13 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
                 start = parsed_args.time_boot_ms_range.get('start', 'N/A')
                 end = parsed_args.time_boot_ms_range.get('end', 'N/A')
                 filtered_count = simplified_result.get("filtered_anomaly_count", 0)
-            
+
                 time_insights_summary.append(f"[THIS QUERY ONLY] FILTERED TO TIME RANGE: {start}-{end}ms. Found {filtered_count} anomalies within this range (out of {anomalies_found} total). THIS FILTER APPLIES ONLY TO THIS SPECIFIC QUESTION.")
-        
+
                 # Add information about tables without time data if applicable
                 if simplified_result.get("tables_without_time_data", 0) > 0:
                     time_insights_summary.append(f"Note: {simplified_result.get('tables_without_time_data', 0)} tables didn't have time_boot_ms data and couldn't be filtered by time.")
-            
+
                 # Add explicit context separation marker
                 simplified_result["context_boundary_marker"] = "TIME_FILTERED_RESULTS_FOR_CURRENT_QUERY_ONLY"
 
@@ -1116,7 +1116,7 @@ def detect_anomalies(tool_input: Any) -> Dict[str, Any]:
             # Add explicit context boundary markers
             simplified_result["query_specific_filter"] = True
             simplified_result["context_boundary"] = "THIS_RESULT_IS_TIME_FILTERED_FOR_CURRENT_QUERY_ONLY"
-        
+
             # Update the summary to emphasize the filtered results
             if simplified_result.get("filtered_anomaly_count", 0) != anomalies_found:
                 filtered_count = simplified_result.get("filtered_anomaly_count", 0)
@@ -1273,6 +1273,7 @@ class TelemetryAgent:
         self.scratchpad: AgentScratchpad = AgentScratchpad(session_id=session_id)
         self.logger: structlog.stdlib.BoundLogger = logger.bind(session_id=session_id)
         self.anomaly_detector: Optional[AnomalyDetector] = None
+        self.tables_info: Optional[str] = None
 
     async def async_initialize(self) -> None:
         """Initialize TelemetryAgent dependencies asynchronously.
@@ -1294,6 +1295,9 @@ class TelemetryAgent:
         # Initialize token usage tracking
         self.token_callback = TokenUsageCallback()
 
+        # Get tables info for the prompt
+        self.tables_info = await self.get_tables_as_string()
+
         # Initialize LLM with deterministic settings
         self.llm = ChatOpenAI(
             model=self.llm_model,
@@ -1311,9 +1315,6 @@ class TelemetryAgent:
         await self.anomaly_detector.initialize()
         self.logger.info("Anomaly detector initialized successfully")
 
-        # Get tables info for the prompt
-        tables_info = await self.get_tables_as_string()
-
         # Define ReAct prompt template
         self.prompt = PromptTemplate(
             template=REACT_SYSTEM_PROMPT,
@@ -1324,7 +1325,7 @@ class TelemetryAgent:
                 "chat_history",
             ],
             partial_variables={
-                "tables": tables_info,
+                "tables": self.tables_info,
                 "tools": "{tools}",
                 "tool_names": "{tool_names}",
             },
@@ -1678,7 +1679,7 @@ class TelemetryAgent:
                     # agent_action_obj is of type langchain_core.agents.AgentAction
                     # observation_str is the string output of the tool
                     tool_input = agent_action_obj.tool_input
-                    
+
                     action_details_for_scratchpad = {
                         "tool": agent_action_obj.tool,
                         "tool_input": tool_input,
@@ -1767,7 +1768,7 @@ class TelemetryAgent:
             scratchpad_tokens = len(
                 self.token_encoder.encode(current_custom_scratchpad)
             )
-            if scratchpad_tokens > self.max_context_tokens // 2:  # type: ignore
+            if scratchpad_tokens > self.max_context_tokens // 15:
                 self.logger.warning(
                     ERROR_SCRATCHPAD_TOKEN_LIMIT,
                     tokens=scratchpad_tokens,
@@ -1776,10 +1777,10 @@ class TelemetryAgent:
                 )
                 # Keep only the most recent steps to reduce token usage
                 self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[
-                    -10:
+                    -2:
                 ]
                 self.logger.info(
-                    "Truncated custom scratchpad to last 10 steps to manage token limit"
+                    "Truncated custom scratchpad to last 2 steps to manage token limit"
                 )
 
             self.logger.info(

@@ -24,8 +24,8 @@ DocumentList: TypeAlias = List[Document]
 
 # Constants for memory configuration
 # Token limits for different memory strategies
-SHORT_TERM_TOKEN_LIMIT: int = 1000  # Maximum tokens for short-term memory
-MEDIUM_TERM_TOKEN_LIMIT: int = 3000  # Maximum tokens for medium-term memory
+SHORT_TERM_TOKEN_LIMIT: int = 300  # Maximum tokens for short-term memory
+MEDIUM_TERM_TOKEN_LIMIT: int = 1500  # Maximum tokens for medium-term memory
 
 # Vector retriever settings
 VECTOR_RETRIEVER_DECAY_RATE: float = (

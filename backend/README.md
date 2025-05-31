@@ -188,7 +188,7 @@ docker run -d --name uav-log-viewer -p 8000:8000 \
 Once running, verify your installation by:
 
 1. Opening the API documentation at `http://localhost:8000/docs`
-2. Accessing the frontend at `http://localhost:8080` 
+2. Accessing the frontend at `http://localhost:8080`
 3. Uploading a sample UAV log file or open sample to test the telemetry processing
 
 ## 📞 API Reference
@@ -330,7 +330,7 @@ The UAV Log Viewer employs advanced neural embedding and approximate nearest nei
 
 **Time-weighted Retrieval** enhances search relevance by boosting similarity scores for recent conversation turns. An exponential decay function maintains contextual freshness, controlled via a configurable half-life parameter. This approach balances semantic meaning with recency to ensure results remain timely and pertinent.
 
-**Multi-tier Memory Architecture** structures memory into three layers: a sliding window buffer for immediate context (~1,000 tokens), a medium-term memory summarized by the language model (~3,000 tokens), and an unlimited, vector-indexed long-term memory. This design dynamically selects relevant context based on query demands and token limits.
+**Multi-tier Memory Architecture** structures memory into three layers: a sliding window buffer for immediate context (~300 tokens), a medium-term memory summarized by the language model (~1,500 tokens), and an unlimited, vector-indexed long-term memory. This design dynamically selects relevant context based on query demands and token limits.
 
 **Hybrid Search** combines vector similarity with exact keyword matching, using a blended ranking algorithm that balances both methods. Metadata-aware filtering refines results further, optimizing retrieval for specialized telemetry domain terminology.
 
