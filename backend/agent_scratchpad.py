@@ -14,7 +14,8 @@ import structlog
 from langchain_core.agents import AgentAction, AgentFinish
 
 # Constants for scratchpad management
-MAX_SCRATCHPAD_STEPS = 3  # Maximum number of steps to keep in the scratchpad
+MAX_SCRATCHPAD_STEPS = 1  # AGGRESSIVE RETENTION: Keep only last 1 step for performance
+SCRATCHPAD_RETENTION_POLICY = "aggressive_last_1_step"  # Policy description
 MAX_OBSERVATION_STORAGE_LENGTH = 5000  # Maximum length of observation to store in full
 MAX_OBSERVATION_SNIPPET_LENGTH = (
     100  # Maximum length of observation snippet for logging
@@ -32,6 +33,9 @@ class AgentScratchpad:
     context for the agent across multiple turns. It formats this history in a way
     that can be included in the agent's prompt, helping it understand what actions
     have already been taken and their outcomes.
+    
+    PERFORMANCE OPTIMIZATION: Implements aggressive retention policy - keeps only the
+    last step to prevent memory buildup and reduce token usage across conversations.
     """
 
     def __init__(self, session_id: str) -> None:
@@ -45,7 +49,7 @@ class AgentScratchpad:
         self.intermediate_steps: List[Tuple[Dict[str, Any], str]] = []
         self.agent_actions: List[Dict[str, Any]] = []
         self.logger = logger.bind(session_id=session_id)
-        self.logger.info("Initialized agent scratchpad")
+        self.logger.info("Initialized agent scratchpad with aggressive retention policy")
 
     def process_agent_action(
         self, next_action: Union[AgentAction, AgentFinish]
@@ -521,7 +525,8 @@ class AgentScratchpad:
 
         This method adds actions and observations to the scratchpad, ensuring
         that context boundaries are clearly marked to prevent context contamination
-        between different queries.
+        between different queries. Implements aggressive retention - keeps only the 
+        last step to optimize performance.
 
         Args:
             action_details (Dict[str, Any]): Details of the agent action
@@ -543,6 +548,16 @@ class AgentScratchpad:
         # Add the action and observation to the intermediate steps
         self.intermediate_steps.append((action_details, compact_observation))
 
+        # AGGRESSIVE RETENTION: Keep only the last N steps to optimize performance
+        # This prevents memory buildup and context confusion across conversations
+        if len(self.intermediate_steps) > MAX_SCRATCHPAD_STEPS:
+            self.intermediate_steps = self.intermediate_steps[-MAX_SCRATCHPAD_STEPS:]
+            self.logger.debug(
+                "Truncated scratchpad for performance optimization",
+                retained_steps=len(self.intermediate_steps),
+                max_steps=MAX_SCRATCHPAD_STEPS
+            )
+
         # Log the addition
         self.logger.debug(
             "Added step to scratchpad",
@@ -550,6 +565,7 @@ class AgentScratchpad:
             observation_snippet=(
                 compact_observation[:100] if compact_observation else "None"
             ),
+            total_steps=len(self.intermediate_steps)
         )
 
     def get_scratchpad_content(self) -> List[Tuple[Dict[str, Any], str]]:
@@ -642,3 +658,32 @@ class AgentScratchpad:
             List[Dict[str, Any]]: List of dictionaries containing action details and observations
         """
         return self.agent_actions
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about the scratchpad.
+        
+        Returns:
+            Dict[str, Any]: Statistics including step count, total size, etc.
+        """
+        total_text = self.to_string()
+        return {
+            "total_steps": len(self.intermediate_steps),
+            "total_characters": len(total_text),
+            "session_id": self.session_id,
+            "retention_policy": SCRATCHPAD_RETENTION_POLICY,
+            "max_steps_configured": MAX_SCRATCHPAD_STEPS
+        }
+
+    def clear(self) -> None:
+        """Clear all steps from the scratchpad."""
+        steps_cleared = len(self.intermediate_steps)
+        self.intermediate_steps.clear()
+        self.agent_actions.clear()
+        self.logger.info(
+            "Cleared scratchpad",
+            steps_cleared=steps_cleared
+        )
+
+    def get_step_count(self) -> int:
+        """Get the current number of steps in the scratchpad."""
+        return len(self.intermediate_steps)

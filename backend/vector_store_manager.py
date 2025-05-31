@@ -26,6 +26,7 @@ DEFAULT_SEARCH_RESULTS: int = (
     3  # Default number of results to return from similarity search
 )
 CACHE_TTL_SECONDS: float = 600.0  # Cache TTL: 10 minutes
+MAX_CACHE_SIZE: int = 50  # Maximum number of cache entries (LRU eviction)
 
 # Error messages for better consistency
 ERROR_NOT_INITIALIZED: str = "Vector store not initialized"
@@ -63,6 +64,7 @@ class VectorStoreManager:
         self.embeddings: OpenAIEmbeddings = embeddings
         self.vector_store: Optional[FAISS] = None
         self._search_cache: Dict[CacheKey, CacheEntry] = {}
+        self._cache_access_order: List[CacheKey] = []  # Track access order for LRU
         self._cache_ttl: float = cache_ttl_seconds
         self.logger = logger.bind(class_name=self.__class__.__name__)
 
@@ -101,6 +103,8 @@ class VectorStoreManager:
 
         for key in expired_keys:
             del self._search_cache[key]
+            if key in self._cache_access_order:
+                self._cache_access_order.remove(key)
 
         if expired_keys:
             self.logger.debug(
@@ -113,6 +117,7 @@ class VectorStoreManager:
         """Clear all cached search results."""
         cache_size = len(self._search_cache)
         self._search_cache.clear()
+        self._cache_access_order.clear()
         self.logger.info("Cleared similarity search cache", cleared_entries=cache_size)
 
     def get_cache_stats(self) -> Dict[str, int]:
@@ -227,6 +232,9 @@ class VectorStoreManager:
         if cache_key in self._search_cache:
             cached_results, timestamp = self._search_cache[cache_key]
             if self._is_cache_valid(timestamp):
+                # Update LRU order
+                self._cache_access_order.remove(cache_key)
+                self._cache_access_order.append(cache_key)
                 self.logger.debug(
                     "Returning cached similarity search results",
                     query=query,
@@ -237,6 +245,8 @@ class VectorStoreManager:
             else:
                 # Remove expired entry
                 del self._search_cache[cache_key]
+                if cache_key in self._cache_access_order:
+                    self._cache_access_order.remove(cache_key)
 
         # Periodically clean up expired entries (every 10th search to avoid overhead)
         if len(self._search_cache) > 0 and len(self._search_cache) % 10 == 0:
@@ -261,14 +271,23 @@ class VectorStoreManager:
                 asyncio.to_thread(run_search), timeout=VECTOR_SEARCH_TIMEOUT_SECONDS
             )
 
-            # Cache the results
+            # Cache the results with LRU eviction
             self._search_cache[cache_key] = (results, time.time())
+            self._cache_access_order.append(cache_key)
+            
+            # Enforce cache size limit with LRU eviction
+            while len(self._search_cache) > MAX_CACHE_SIZE:
+                oldest_key = self._cache_access_order.pop(0)
+                if oldest_key in self._search_cache:
+                    del self._search_cache[oldest_key]
+                    self.logger.debug("Evicted cache entry due to size limit", evicted_key=oldest_key)
 
             self.logger.debug(
                 "Performed vector store similarity search and cached results",
                 query=query,
                 result_count=len(results),
-                cache_size=len(self._search_cache)
+                cache_size=len(self._search_cache),
+                max_cache_size=MAX_CACHE_SIZE
             )
             return results
         except asyncio.TimeoutError:

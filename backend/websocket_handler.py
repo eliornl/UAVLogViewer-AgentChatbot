@@ -305,7 +305,6 @@ async def handle_websocket_message(
                     response, meta = await agent.process_message(message_text)
                     response_text = response
                     metadata = meta
-
                     # Simulate token-by-token streaming
                     words = response.split()
                     for word in words:

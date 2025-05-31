@@ -412,11 +412,17 @@ class QueryDuckDBInput(BaseModel):
 # Cache for database connections to avoid repeated connection overhead
 db_connection_cache = {}
 
-# Cache for query results to avoid repeating identical queries
+# Cache for query results to avoid repeating identical queries with TTL and LRU
 query_result_cache = {}
+query_cache_access_order = []  # Track access order for LRU eviction
+query_cache_timestamps = {}   # Track cache entry timestamps for TTL
 
 # Maximum size for the query cache to prevent memory issues
-MAX_QUERY_CACHE_SIZE = 2
+MAX_QUERY_CACHE_SIZE = 20  # Increased from 2 for better performance
+QUERY_CACHE_TTL_SECONDS = 300  # 5 minutes TTL for query results
+
+# Database connection pool configuration
+MAX_DB_CONNECTIONS = 10  # Maximum number of cached database connections
 
 async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
     """Execute a SQL query on a DuckDB database with optimized performance.
@@ -484,10 +490,25 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
         keyword = re.search(dangerous_pattern, query_lower).group(1)
         return {"status": "error", "message": f"Query contains prohibited keyword: {keyword}"}
 
-    # Check cache for this exact query
+    # Check cache for this exact query with TTL validation
     cache_key = f"{db_path}:{query}"
     if cache_key in query_result_cache:
-        return query_result_cache[cache_key]
+        # Check if cache entry is still valid (TTL)
+        if (cache_key in query_cache_timestamps and 
+            time.time() - query_cache_timestamps[cache_key] < QUERY_CACHE_TTL_SECONDS):
+            # Update LRU order
+            if cache_key in query_cache_access_order:
+                query_cache_access_order.remove(cache_key)
+            query_cache_access_order.append(cache_key)
+            return query_result_cache[cache_key]
+        else:
+            # Remove expired entry
+            if cache_key in query_result_cache:
+                del query_result_cache[cache_key]
+            if cache_key in query_cache_timestamps:
+                del query_cache_timestamps[cache_key]
+            if cache_key in query_cache_access_order:
+                query_cache_access_order.remove(cache_key)
 
     try:
         # Reuse database connection if available
@@ -495,13 +516,15 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
             conn = db_connection_cache[db_path]
         else:
             # Limit cache size to prevent memory issues
-            if len(db_connection_cache) > 5:  # Keep max 5 connections
+            if len(db_connection_cache) > MAX_DB_CONNECTIONS:
                 oldest_key = next(iter(db_connection_cache))
                 db_connection_cache[oldest_key].close()
                 del db_connection_cache[oldest_key]
+                logger.debug("Evicted database connection from cache", db_path=oldest_key)
 
             conn = duckdb.connect(db_path, read_only=True)
             db_connection_cache[db_path] = conn
+            logger.debug("Created new database connection", db_path=db_path, pool_size=len(db_connection_cache))
 
         # Check if query is trying to access a table that might not exist
         if 'FROM ' in query.upper() and not query.upper().startswith('SELECT EXISTS'):
@@ -530,13 +553,20 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
         # Store in cache
         response = {"status": "success", "data": data_to_return, "row_count": row_count}
 
-        # Manage cache size
-        if len(query_result_cache) >= MAX_QUERY_CACHE_SIZE:
-            # Remove oldest entry (first key)
-            oldest_key = next(iter(query_result_cache))
-            del query_result_cache[oldest_key]
-
+        # Cache the response with timestamp and LRU management
         query_result_cache[cache_key] = response
+        query_cache_timestamps[cache_key] = time.time()
+        query_cache_access_order.append(cache_key)
+        
+        # Enforce cache size limit with LRU eviction
+        while len(query_result_cache) > MAX_QUERY_CACHE_SIZE:
+            if query_cache_access_order:
+                oldest_key = query_cache_access_order.pop(0)
+                if oldest_key in query_result_cache:
+                    del query_result_cache[oldest_key]
+                if oldest_key in query_cache_timestamps:
+                    del query_cache_timestamps[oldest_key]
+        
         return response
 
     except duckdb.Error as e:
@@ -545,9 +575,9 @@ async def query_duckdb(tool_input: Any) -> Dict[str, Any]:
         return {"status": "error", "message": f"Unexpected error: {str(e)}"}
 
 # Function to clear caches if needed
-def clear_query_caches():
+def clear_query_caches() -> None:
     """Clear all query and connection caches."""
-    global query_result_cache, db_connection_cache
+    global query_result_cache, db_connection_cache, query_cache_access_order, query_cache_timestamps
 
     # Close all database connections
     for conn in db_connection_cache.values():
@@ -558,7 +588,38 @@ def clear_query_caches():
 
     # Reset caches
     query_result_cache = {}
+    query_cache_access_order = []
+    query_cache_timestamps = {}
     db_connection_cache = {}
+
+def get_cache_stats() -> Dict[str, Any]:
+    """Get statistics about all caches for monitoring.
+    
+    Returns:
+        Dict[str, Any]: Cache statistics including sizes, hit rates, etc.
+    """
+    import time
+    current_time = time.time()
+    
+    # Count valid query cache entries
+    valid_query_entries = sum(
+        1 for key, timestamp in query_cache_timestamps.items()
+        if current_time - timestamp < QUERY_CACHE_TTL_SECONDS
+    )
+    
+    return {
+        "query_cache": {
+            "total_entries": len(query_result_cache),
+            "valid_entries": valid_query_entries,
+            "expired_entries": len(query_result_cache) - valid_query_entries,
+            "max_size": MAX_QUERY_CACHE_SIZE,
+            "ttl_seconds": QUERY_CACHE_TTL_SECONDS
+        },
+        "db_connections": {
+            "active_connections": len(db_connection_cache),
+            "max_connections": MAX_DB_CONNECTIONS
+        }
+    }
 
 class DetectAnomaliesMLInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
@@ -1787,24 +1848,28 @@ class TelemetryAgent:
                 ),  # Add raw output for easier debugging
             }
 
-            # Manage custom scratchpad size to prevent token limit issues
+            # Monitor scratchpad size - aggressive retention is now handled at scratchpad level
             scratchpad_tokens = len(
                 self.token_encoder.encode(current_custom_scratchpad)
             )
-            if scratchpad_tokens > self.max_context_tokens // 15:
+            self.logger.debug(
+                "Scratchpad token usage",
+                tokens=scratchpad_tokens,
+                max_context_tokens=self.max_context_tokens,
+                token_percentage=f"{(scratchpad_tokens / self.max_context_tokens) * 100:.1f}%",
+                steps_retained=len(self.scratchpad.intermediate_steps)
+            )
+            
+            # Fallback safety check: if scratchpad still grows too large despite aggressive retention
+            if scratchpad_tokens > self.max_context_tokens // 10:  # More restrictive threshold
                 self.logger.warning(
-                    ERROR_SCRATCHPAD_TOKEN_LIMIT,
+                    "Scratchpad exceeds safety threshold despite aggressive retention",
                     tokens=scratchpad_tokens,
                     max_context_tokens=self.max_context_tokens,
-                    token_percentage=f"{(scratchpad_tokens / self.max_context_tokens) * 100:.1f}%",
                 )
-                # Keep only the most recent steps to reduce token usage
-                self.scratchpad.intermediate_steps = self.scratchpad.intermediate_steps[
-                    -2:
-                ]
-                self.logger.info(
-                    "Truncated custom scratchpad to last 2 steps to manage token limit"
-                )
+                # Clear scratchpad entirely as last resort
+                self.scratchpad.clear()
+                self.logger.info("Cleared scratchpad entirely as safety measure")
 
             self.logger.info(
                 "Generated response",
