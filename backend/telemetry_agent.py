@@ -594,6 +594,7 @@ def get_cache_stats() -> Dict[str, Any]:
         },
     }
 
+
 class DetectAnomaliesBatchInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
     tables: Optional[List[str]] = Field(
@@ -1440,10 +1441,10 @@ class TelemetryAgent:
             agent=agent,
             tools=tools,
             verbose=True,
-            handle_parsing_errors=True,  
-            max_iterations=30, 
-            max_execution_time=20,  
-            return_intermediate_steps=True,  
+            handle_parsing_errors=True,
+            max_iterations=30,
+            max_execution_time=20,
+            return_intermediate_steps=True,
         )
 
     def _validate_token_limits(self) -> None:
