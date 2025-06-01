@@ -4,6 +4,8 @@
 
 #### Advanced AI-powered telemetry analysis with natural language interface for UAV logs
 
+#### [Watch how the Agentic AI Chatbot works](#agentic-ai-chatbot-demo)
+
 [![UAV Log Viewer](https://img.shields.io/badge/UAV%20Log%20Viewer-Agentic%20Chatbot-blue?style=for-the-badge)](https://github.com/yourusername/UAVLogViewer-AgentChatbot)
 [![Python](https://img.shields.io/badge/Python-3.10+-green?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100.0+-blue?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
@@ -35,6 +37,7 @@
 - [Security](#security-considerations)
 - [License](#license)
 - [Contributing](#contributing)
+- [AI Chatbot Demo](#agentic-ai-chatbot-demo)
 
 ---
 
@@ -193,6 +196,8 @@ Once running, verify your installation by:
 2. Accessing the frontend at `http://localhost:8080`
 3. Uploading a sample UAV log file or open sample to test the telemetry processing
 
+---
+
 ## 📞 API Reference
 
 The UAV Log Viewer exposes a comprehensive API for integrating telemetry analysis capabilities into your applications.
@@ -211,6 +216,8 @@ The UAV Log Viewer exposes a comprehensive API for integrating telemetry analysi
 \* *Authentication should be implemented for production deployments*
 
 For complete API documentation, access the interactive Swagger UI at `/docs` when the server is running.
+
+---
 
 ## 🤖 AI Agent Capabilities
 
@@ -270,6 +277,8 @@ The agent is fully integrated with the core system architecture:
 
 - **Session Isolation**: Maintains independent agent state per user session with proper resource management.
 
+---
+
 ## 🔄 WebSocket Integration
 
 The UAV Log Viewer implements a bidirectional WebSocket communication system for real-time token streaming with automatic HTTP fallback for maximum reliability.
@@ -282,9 +291,13 @@ The UAV Log Viewer implements a bidirectional WebSocket communication system for
 - **Backpressure Handling**: Token buffer with configurable high-water mark to prevent client overflow.
 - **Error Recovery**: Implements exponential backoff for reconnection attempts with jitter.
 
+---
+
 ## 📊 Telemetry Processing Pipeline
 
 The UAV Log Viewer features a high-throughput processing pipeline that transforms raw MAVLink binary logs into optimized analytical data structures through a multi-stage ETL process.
+
+---
 
 ## 📝 Telemetry Schema Intelligence
 
@@ -314,6 +327,8 @@ The Telemetry Schema Intelligence system is deeply integrated throughout the UAV
 
 - **💎 Anomaly Detection**: Establishes baseline expectations to detect unusual patterns and potential issues in flight telemetry data.
 
+---
+
 ## 🔎 Vector Search Technology
 
 The UAV Log Viewer employs advanced neural embedding and approximate nearest neighbor search technologies to enable semantic retrieval of conversation context and telemetry knowledge.
@@ -336,11 +351,15 @@ The UAV Log Viewer employs advanced neural embedding and approximate nearest nei
 
 **Hybrid Search** combines vector similarity with exact keyword matching, using a blended ranking algorithm that balances both methods. Metadata-aware filtering refines results further, optimizing retrieval for specialized telemetry domain terminology.
 
+---
+
 ## 🔒 Security Considerations
 
 UAV Log Viewer is built with strong security principles to ensure the integrity of telemetry data and the safety of user interactions.
 
 Session isolation ensures that each user operates in a sandboxed environment with dedicated locking mechanisms. All incoming inputs are rigorously validated through Pydantic models, enforcing strict data integrity. Request rate limiting protects the API from abuse, while structured error handling prevents accidental information disclosure. Sensitive configurations, such as API keys and credentials, are securely managed through environment variables.
+
+---
 
 ## 📝 License
 
@@ -358,3 +377,11 @@ Contributions are welcome! Here's how you can contribute:
 4. **Submit** a pull request with a clear description
 
 Please follow the project's coding style and include appropriate tests for new functionality.
+
+---
+
+## 🎥 Agentic AI Chatbot Demo
+
+Watch how the Agentic AI Chatbot works, seamlessly integrated with the UAV Log Viewer Project.
+
+https://github.com/eliornl/UAVLogViewer-AgentChatbot/blob/1d42516699ac8a881cfde98a3e2dffbf75f151de/agentic_ai_chatbot_demo.mp4
