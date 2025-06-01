@@ -1,7 +1,3 @@
-
-
-https://github.com/user-attachments/assets/5ff08fce-19fa-49fc-b9e4-a03a49996144
-
 <div align="center">
 
 # 🚁 UAV Log Viewer Agentic Chatbot
@@ -384,8 +380,8 @@ Please follow the project's coding style and include appropriate tests for new f
 
 ---
 
-## 🎥 Agentic AI Chatbot Demo
+## Agentic AI Chatbot Demo
 
 Watch how the Agentic AI Chatbot works, seamlessly integrated with the UAV Log Viewer Project.
 
-https://github.com/eliornl/UAVLogViewer-AgentChatbot/blob/1d42516699ac8a881cfde98a3e2dffbf75f151de/agentic_ai_chatbot_demo.mp4
+https://github.com/user-attachments/assets/5ff08fce-19fa-49fc-b9e4-a03a49996144
