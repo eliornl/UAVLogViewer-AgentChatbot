@@ -10,7 +10,7 @@ appropriate SQL queries or anomaly detection algorithms, and provide insights
 about flight performance, system status, and potential issues.
 """
 
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 import os
 import time
 from pydantic import BaseModel, Field, model_validator, ValidationError
@@ -100,7 +100,7 @@ REACT_SYSTEM_PROMPT = """You are a telemetry data analysis assistant specialized
 - Scratchpad: {agent_scratchpad_content}
 - Chat History: {chat_history}
 
-If the exact question "{input}" was already answered, provide that answer and stop.
+If the exact question "{input}" was already answered, provide that answer prefixed with "From previous analysis:" and stop.
 
 ## Available Tables
 {tables}
@@ -118,21 +118,22 @@ Final Answer: [data-grounded conclusion]
 ## Decision Tree
 
 ### 1. Handle Non-Flight Queries
-- **Greetings/Small talk**: Respond directly with friendly greeting
-- **Off-topic questions**: Politely redirect to flight data topics
-- **Unclear questions**: Ask for clarification
+- **Greetings/Identity questions** ("hello", "who are you", etc.): Skip tools, explain you are a flight telemetry analysis assistant
+- **Off-topic questions**: Skip tools, politely decline and redirect to flight data topics
+- **Unclear requests**: Skip tools, ask for clarification about flight data needs
+- **Format**: Thought → Final Answer (no Action/tools needed)
 
 ### 2. Flight Phase Analysis
 If query mentions specific phases (takeoff/mid-flight/landing):
 1. Get time range: `query_duckdb` for MIN/MAX time_boot_ms FROM telemetry_attitude, and calculate the full flight duration
 2. Calculate phase boundaries: Based on the full flight duration, define the following phases: Takeoff (0-15%), Mid-flight (15-85%), Landing (85-100%)
-3. If asking about anomalies/issues: Use `detect_anomalies` with time range, focus on the relevant table if the question is specific, otherwise check all: ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]
+3. If asking about anomalies or similar general problems words: Use `detect_anomalies` with time range, focus on the relevant table if the question is specific, otherwise check ONLY these tables: ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]
 4. If asking about metrics: Use `query_duckdb` with time filter
 - **Ensure that each query result includes time_boot_ms (if available) and that it falls within the calculated phase boundaries**
 
 ### 3. Anomaly Detection
 For queries about "errors", "anomalies", "issues", "problems", "failures", or similar general problems words:
-- **Broad queries**: `detect_anomalies` on all tables: ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]
+- **Broad queries**: `detect_anomalies` ONLY these tables: ["telemetry_attitude", "telemetry_global_position_int", "telemetry_gps_raw_int"]
 - **System-specific**: `detect_anomalies` on specific table
 - **Always use `detect_anomalies` for anomaly-related queries**
 
@@ -142,9 +143,9 @@ For direct data requests (voltages, positions, etc.):
 - Check schema for correct column names (use `time_boot_ms` not `timestamp`)
 
 ## Critical Rules
-1. **Tool Selection**: Use `detect_anomalies` for ANY anomaly/error queries
-2. **Column Names**: Verify exact names from {tables} schema
-3. **Time Filtering**: Each question is independent - don't carry over time ranges
+1. **Tool Selection**: Use `detect_anomalies` for ANY anomalies or similar general problems words
+2. **Action Input Format**: NEVER use ```json code blocks - always use raw JSON for Action Input
+3. **Column Names**: Verify exact names from {tables} schema
 4. **Data First**: Base conclusions only on tool observations
 5. **JSON Format**: Ensure Action Input is valid JSON
 
@@ -592,13 +593,6 @@ def get_cache_stats() -> Dict[str, Any]:
             "max_connections": MAX_DB_CONNECTIONS,
         },
     }
-
-
-class DetectAnomaliesMLInput(BaseModel):
-    db_path: str = Field(description="Path to the DuckDB database file")
-    table: str = Field(description="Name of the telemetry table")
-    columns: List[str] = Field(description="Numerical columns to analyze")
-
 
 class DetectAnomaliesBatchInput(BaseModel):
     db_path: str = Field(description="Path to the DuckDB database file")
