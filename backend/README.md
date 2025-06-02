@@ -150,8 +150,21 @@ cd UAVLogViewer-AgentChatbot
 
 # Create and activate virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+```
 
+**Activate virtual environment:**
+
+**Mac/Linux:**
+```bash
+source venv/bin/activate
+```
+
+**Windows:**
+```cmd
+venv\Scripts\activate
+```
+
+```bash
 # Install dependencies
 cd backend
 pip install -U pip setuptools wheel
@@ -200,29 +213,6 @@ gunicorn -w 4 -k uvicorn.workers.UvicornWorker backend.main:app --bind 0.0.0.0:8
 docker build -t uavlogviewer-agentchatbot .
 docker run -d --name uavlogviewer-agentchatbot -p 8000:8000 \
  -v $(pwd)/storage:/app/storage --env-file .env uavlogviewer-agentchatbot
-```
-
-### Running the Application
-
-**Note:** All commands should be run from the main project directory.
-
-#### Development Mode
-
-```bash
-# Start backend with auto-reload for development
-uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-#### Production Mode
-
-```bash
-# Option 1: Using Gunicorn with multiple workers (recommended for production)
-gunicorn -w 4 -k uvicorn.workers.UvicornWorker backend.main:app --bind 0.0.0.0:8000
-
-# Option 2: Using Docker
-docker build -t uavlogviewer-agentchatbot .
-docker run -d --name uavlogviewer-agentchatbot -p 8000:8000 \
-  -v $(pwd)/storage:/app/storage --env-file .env uavlogviewer-agentchatbot
 ```
 
 ### Verification
