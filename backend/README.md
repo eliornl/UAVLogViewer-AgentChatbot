@@ -143,7 +143,7 @@ The UAV Log Viewer leverages a carefully selected stack of technologies, each ch
 
 ```bash
 # Clone repository and navigate to project directory
-git clone https://github.com/yourusername/UAVLogViewer-AgentChatbot.git
+git clone https://github.com/eliornl/UAVLogViewer-AgentChatbot.git
 cd UAVLogViewer-AgentChatbot
 
 # Create and activate virtual environment
@@ -159,7 +159,11 @@ pip install -r requirements.txt
 
 Create a `.env` file in the backend directory with the following variables (Only OPENAI_API_KEY is required, other settings have defaults):
 
-```ini
+#### Creating .env File:
+- **Mac/Linux**: `touch .env` or `nano .env`
+- **Windows**: `echo. > .env` or right-click → New → Text Document → rename to `.env`
+
+```env
 STORAGE_DIR=path_to_storage_directory
 LOG_LEVEL=logging_verbosity_level
 OPENAI_API_KEY=your_openai_api_key_here
@@ -168,6 +172,8 @@ MAX_MODEL_TOKENS=maximum_tokens_per_request
 ```
 
 ### Running the Application
+
+**Note:** All commands should be run from the main project directory.
 
 #### Development Mode
 
@@ -183,9 +189,9 @@ uvicorn backend.main:app --host 0.0.0.0 --port 8000 --reload
 gunicorn -w 4 -k uvicorn.workers.UvicornWorker backend.main:app --bind 0.0.0.0:8000
 
 # Option 2: Using Docker
-docker build -t uav-log-viewer .
-docker run -d --name uav-log-viewer -p 8000:8000 \
-  -v $(pwd)/storage:/app/storage --env-file .env uav-log-viewer
+docker build -t uavlogviewer-agentchatbot .
+docker run -d --name uavlogviewer-agentchatbot -p 8000:8000 \
+  -v $(pwd)/storage:/app/storage --env-file .env uavlogviewer-agentchatbot
 ```
 
 ### Verification
