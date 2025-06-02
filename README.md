@@ -15,6 +15,13 @@ For detailed setup instructions, API reference, and advanced usage guidance, ref
 
 **Note:** If you want to use the AI chatbot functionality, start the backend first following the [backend README](./backend/README.md) instructions, then proceed with the frontend setup below.
 
+If not using the backend:
+
+```bash
+git clone https://github.com/eliornl/UAVLogViewer-AgentChatbot.git
+cd UAVLogViewer-AgentChatbot
+```
+
 ### Initialize Submodules
 
 Initialize and update the project submodules:
