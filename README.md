@@ -22,15 +22,6 @@ git clone https://github.com/eliornl/UAVLogViewer-AgentChatbot.git
 cd UAVLogViewer-AgentChatbot
 ```
 
-### Initialize Submodules
-
-Initialize and update the project submodules:
-
-```bash
-# Initialize submodules recursively
-git submodule update --init --recursive
-```
-
 ### Install and Run
 
 ``` bash
