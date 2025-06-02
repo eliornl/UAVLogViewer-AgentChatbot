@@ -141,7 +141,7 @@ The UAV Log Viewer leverages a carefully selected stack of technologies, each ch
 
 ## Installation
 
-**Note:** This installation guide is for the backend only. For frontend installation instructions, please refer to the README in the main project directory.
+**Note:** This installation guide is for the backend only. For frontend installation instructions, please refer to the README in the main project directory. Run the backend first, then the frontend.
 
 ### 1. Clone and Setup
 

@@ -2,16 +2,29 @@
 
 ![log seeking](preview.gif "Logo Title Text 1")
 
- This is a Javascript based log viewer for Mavlink telemetry and dataflash logs.
+This is a Javascript based log viewer for Mavlink telemetry and dataflash logs.
 [Live demo here](http://plot.ardupilot.org).
 
 ## Agentic Chatbot
 
-Effortlessly analyze UAV telemetry with our intelligent AI chatbot. Ask natural questions like “How long was the total flight time?” or “Are there any anomalies in this flight?” and get instant, actionable insights.
+Effortlessly analyze UAV telemetry with our intelligent AI chatbot. Ask natural questions like "How long was the total flight time?" or "Are there any anomalies in this flight?" and get instant, actionable insights.
 
 For detailed setup instructions, API reference, and advanced usage guidance, refer to the [backend README](./backend/README.md).
 
 ## Build Setup
+
+**Note:** If you want to use the AI chatbot functionality, start the backend first following the [backend README](./backend/README.md) instructions, then proceed with the frontend setup below.
+
+### Initialize Submodules
+
+Initialize and update the project submodules:
+
+```bash
+# Initialize submodules recursively
+git submodule update --init --recursive
+```
+
+### Install and Run
 
 ``` bash
 # install dependencies
@@ -31,29 +44,4 @@ npm run e2e
 
 # run all tests
 npm test
-```
-
-# Docker
-
-run the prebuilt docker image:
-
-``` bash
-docker run -p 8080:8080 -d ghcr.io/ardupilot/uavlogviewer:latest
-
-```
-
-or build the docker file locally:
-
-``` bash
-
-# Build Docker Image
-docker build -t <your username>/uavlogviewer .
-
-# Run Docker Image
-docker run -e VUE_APP_CESIUM_TOKEN=<Your cesium ion token> -it -p 8080:8080 -v ${PWD}:/usr/src/app <your username>/uavlogviewer
-
-# Navigate to localhost:8080 in your web browser
-
-# changes should automatically be applied to the viewer
-
 ```
