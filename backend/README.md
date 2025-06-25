@@ -421,4 +421,4 @@ Please follow the project's coding style and include appropriate tests for new f
 
 Watch how the Agentic AI Chatbot works, seamlessly integrated with the UAV Log Viewer Project.
 
-https://github.com/user-attachments/assets/5ff08fce-19fa-49fc-b9e4-a03a49996144
+https://github.com/user-attachments/assets/1c21622a-23eb-4fbd-b2a1-b563e65b3344
